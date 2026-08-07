@@ -1,0 +1,191 @@
+# =============================================================================
+# k8s/model-provisioning/02-persistentvolume.yaml
+#
+# WHAT IS GCS FUSE CSI?
+#   GCS Fuse CSI Driver is a GKE-managed Container Storage Interface plugin
+#   that mounts a GCS bucket as a POSIX-compatible filesystem inside a pod.
+#
+#   Without GCS Fuse:
+#     vLLM would need to download 14 GB from GCS at startup using Python/gsutil
+#     → Slow: 3-10 min per pod × 2-3 pods = 6-30 min total startup
+#     → Redundant: each pod downloads independently
+#
+#   With GCS Fuse CSI:
+#     vLLM reads model weight files directly from GCS via a FUSE mount
+#     → Files appear as local filesystem paths (/models/mistral-7b-instruct/)
+#     → vLLM's `--model /models/mistral-7b-instruct` arg works unchanged
+#     → Multiple pods share the same GCS source simultaneously (ReadOnlyMany)
+#     → GCS Fuse caches hot data in memory — subsequent reads are fast
+#     → No per-pod download — startup time reduced to kernel-load time (~5-10 min)
+#
+# HOW GCS FUSE CSI WORKS IN GKE:
+#   1. GKE node has the gcsfuse daemon installed (managed by GKE, enabled via
+#      --addons GcsFuseCsiDriver at cluster creation or via gcloud update)
+#   2. When a pod mounts a GCS Fuse PVC, the kubelet asks the CSI driver
+#   3. The CSI driver runs gcsfuse as a sidecar in the pod's network namespace
+#   4. gcsfuse authenticates to GCS via the pod's Workload Identity (vllm-sa)
+#   5. The bucket appears as a local directory — reads trigger GCS API calls
+#      (with memory caching for repeated reads of the same file chunks)
+#
+# ENABLE GCS FUSE CSI ON YOUR CLUSTER (run once):
+#   gcloud container clusters update CLUSTER_NAME \
+#     --update-addons GcsFuseCsiDriver=ENABLED \
+#     --region REGION
+#
+# STATIC vs DYNAMIC PROVISIONING:
+#   We use STATIC provisioning (this file) rather than dynamic StorageClass.
+#   WHY static?
+#     • We control exactly which bucket and prefix is mounted
+#     • The bucket is pre-existing (created by Terraform in Phase 6)
+#     • Dynamic provisioning creates NEW buckets — wrong for serving existing model
+#     • Static PVs have explicit claimRef binding — no accidental PVC capture
+#
+# THIS PV IS READ-ONLY (accessModes: ReadOnlyMany):
+#   The download Job writes to GCS using gcloud storage commands (not via FUSE).
+#   The vLLM Deployment reads from GCS via this PV.
+#   Keeping the serving PV read-only prevents any pod from corrupting model files.
+#
+# CRITICAL: The PV name `model-gcs-pv` and the claimRef `model-pvc` are
+#   referenced in k8s/vllm/01-deployment.yaml. Do not rename without updating
+#   the vLLM Deployment.
+#
+# COMMAND: kubectl apply -f k8s/model-provisioning/02-persistentvolume.yaml
+# VERIFY:  kubectl get pv model-gcs-pv
+# =============================================================================
+
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: model-gcs-pv             # Cluster-scoped — PVs have no namespace
+
+  labels:
+    app.kubernetes.io/name: model-provisioning
+    app.kubernetes.io/component: persistentvolume
+    app.kubernetes.io/part-of: mistral-gateway
+    model: mistral-7b-instruct-v0.3
+
+spec:
+  # ── Capacity ────────────────────────────────────────────────────────────────
+  # WHY 50Gi?
+  #   For GCS-backed volumes, this is INFORMATIONAL — GCS has no quota limit
+  #   imposed here. Kubernetes uses this value to match PVC storage requests.
+  #   Our PVC (03-persistentvolumeclaim.yaml) requests 50Gi — they must match.
+  #
+  #   Actual Mistral-7B-Instruct-v0.3 size: ~14.5 GB (safetensors format).
+  #   50Gi provides room for tokenizer files, config, and future model versions.
+  capacity:
+    storage: 50Gi
+
+  # ── Access modes ────────────────────────────────────────────────────────────
+  # WHY ReadOnlyMany?
+  #   ReadOnlyMany (ROX) allows multiple nodes to mount the volume simultaneously
+  #   in read-only mode. This is exactly what we need:
+  #     • vLLM replica pod on node-1 mounts → reads model weights
+  #     • vLLM replica pod on node-2 mounts → reads model weights
+  #   Both pods read from the same GCS bucket concurrently — GCS supports this
+  #   natively (object storage is inherently multi-reader).
+  #
+  #   Other modes not suitable here:
+  #     ReadWriteOnce (RWO) — only one node can mount, blocks second vLLM replica
+  #     ReadWriteMany (RWX) — allows writes, but vLLM only reads model files
+  accessModes:
+    - ReadOnlyMany
+
+  # ── Reclaim policy ──────────────────────────────────────────────────────────
+  # WHY Retain?
+  #   When the PVC is deleted (e.g., during a namespace cleanup or mistake),
+  #   Retain keeps the PV object and the underlying GCS data intact.
+  #
+  #   The alternative (Delete) would attempt to delete the GCS bucket contents
+  #   when the PVC is released — permanently destroying the 14 GB model.
+  #   Downloading it again from Hugging Face takes 30-60 minutes.
+  #   Retain is the only safe policy for irreplaceable data.
+  #
+  #   After a PVC deletion with Retain policy, the PV status becomes "Released".
+  #   To reuse it: remove the claimRef manually, then re-create the PVC.
+  persistentVolumeReclaimPolicy: Retain
+
+  # ── Storage class ───────────────────────────────────────────────────────────
+  # WHY empty string?
+  #   storageClassName: "" means this is a STATICALLY provisioned PV.
+  #   It will NOT be managed by any dynamic StorageClass provisioner.
+  #   Only a PVC with storageClassName: "" or no storageClassName can bind to it.
+  #   This prevents dynamic provisioners from interfering with this PV.
+  storageClassName: ""
+
+  # ── Pre-bind to specific PVC ─────────────────────────────────────────────────
+  # WHY claimRef?
+  #   Pre-binding ensures ONLY `model-pvc` in `mistral-gateway` can claim this PV.
+  #   Without claimRef:
+  #     • Any PVC requesting 50Gi ReadOnlyMany in the cluster could claim this PV
+  #     • A dev accidentally creating a test PVC might steal the model volume
+  #     • The vLLM Deployment would then fail with "model-pvc not found"
+  #   With claimRef: the PV waits specifically for model-pvc to be created.
+  claimRef:
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    name: model-pvc               # Must match PVC in 03-persistentvolumeclaim.yaml
+    namespace: mistral-gateway    # PVs are cluster-scoped but PVCs are namespaced
+
+  # ── CSI driver configuration ─────────────────────────────────────────────────
+  csi:
+    # WHY gcsfuse.csi.storage.gke.io?
+    #   This is the official GKE GCS Fuse CSI driver identifier. It must match
+    #   exactly what's installed on the cluster. Other CSI drivers (e.g.,
+    #   kubernetes.io/gce-pd) use different identifiers.
+    driver: gcsfuse.csi.storage.gke.io
+
+    # WHY volumeHandle is the bucket name?
+    #   For GCS Fuse CSI, the volumeHandle identifies the GCS bucket to mount.
+    #   Format: BUCKET_NAME or BUCKET_NAME/PREFIX
+    #
+    #   Using BUCKET_NAME/mistral-7b-instruct (with prefix) mounts only the
+    #   model subdirectory — not the entire bucket. This means vLLM sees:
+    #     /models/config.json
+    #     /models/model-00001-of-00003.safetensors
+    #     ...
+    #   Instead of the bucket root, keeping the mount clean.
+    #
+    #   Replace PROJECT_ID with your actual GCP project ID.
+    #   The bucket must be created before applying this manifest (Terraform Phase 6).
+    volumeHandle: "PROJECT_ID-mistral-models/mistral-7b-instruct"
+
+    # WHY readOnly: true?
+    #   Belt-and-suspenders: even if a pod somehow gets write access to the PV,
+    #   the CSI driver enforces read-only at the FUSE mount level.
+    #   gcsfuse will refuse any write() syscall and return EROFS.
+    readOnly: true
+
+    volumeAttributes:
+      # ── GCS Fuse mount options ─────────────────────────────────────────────
+      # These control gcsfuse's behavior for this specific mount.
+      # Reference: https://cloud.google.com/storage/docs/gcsfuse-cli
+
+      # WHY implicit-dirs?
+      #   GCS is a flat key-value store — "directories" don't exist natively.
+      #   A path like "mistral-7b-instruct/config.json" is a key with a slash.
+      #   implicit-dirs makes gcsfuse treat any key prefix as a directory,
+      #   allowing `ls /models/` to work as expected.
+      #   Without this: ls might return empty or fail for prefixed paths.
+      mountOptions: "implicit-dirs"
+
+      # WHY gcsfuseLoggingSeverity: warning?
+      #   GCS Fuse is verbose at INFO level — every file read generates log entries.
+      #   During model loading, vLLM reads thousands of chunks from safetensors
+      #   files, generating tens of thousands of log lines per startup.
+      #   "warning" level logs only errors and warnings — not normal read operations.
+      gcsfuseLoggingSeverity: warning
+
+      # WHY fileCacheCapacity?
+      #   GCS Fuse can cache file data in memory to reduce GCS API calls.
+      #   vLLM reads model weight files ONCE per startup (sequential read).
+      #   After loading, weights live in GPU VRAM — GCS Fuse cache is not used.
+      #   Setting a modest cache (2Gi) helps if vLLM needs to re-read any chunks.
+      #   This uses node RAM from the pod's memory allocation.
+      fileCacheCapacity: "2Gi"
+
+      # WHY metadataCacheTtlSeconds?
+      #   GCS Fuse can cache object metadata (file sizes, existence checks).
+      #   Once the model is uploaded, files don't change — cache for 24 hours.
+      #   This eliminates redundant GCS metadata API calls during model loading.
+      metadataCacheTtlSeconds: "86400"

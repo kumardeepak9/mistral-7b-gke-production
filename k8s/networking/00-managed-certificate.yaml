@@ -1,0 +1,58 @@
+# =============================================================================
+# k8s/networking/00-managed-certificate.yaml
+#
+# WHAT IS ManagedCertificate?
+#   A GKE-specific CRD (Custom Resource Definition) that instructs GCP to
+#   automatically provision, rotate, and renew a Google-managed TLS certificate
+#   for a domain. It eliminates the need to:
+#     • Purchase certificates from a CA
+#     • Manually store certificate files as Kubernetes Secrets
+#     • Set up cert-manager / Let's Encrypt (complex, requires extra RBAC)
+#     • Remember to renew certificates before they expire
+#
+# HOW IT WORKS:
+#   1. You apply this resource with your domain name
+#   2. GKE Ingress controller links it to the HTTPS Load Balancer frontend
+#   3. Google's Certificate Authority issues a DV (Domain Validation) certificate
+#   4. Google automatically rotates the cert before expiry (90 days → renewed at 30 days)
+#   5. Zero downtime rotation — old cert serves while new cert is provisioned
+#
+# PREREQUISITE — DNS must be configured BEFORE applying:
+#   The ManagedCertificate provisioning FAILS if DNS doesn't point to the LB IP.
+#   Order of operations:
+#     Step 1: Reserve a static IP (gcloud compute addresses create mistral-gateway-ip --global)
+#     Step 2: Create a DNS A record: api.example.com → static IP
+#     Step 3: Apply Ingress (creates LB using the static IP)
+#     Step 4: Apply this ManagedCertificate (Google verifies domain ownership via DNS)
+#     Step 5: Wait ~15 minutes for certificate to become ACTIVE
+#
+# VERIFY STATUS:
+#   kubectl describe managedcertificate mistral-tls-cert -n mistral-gateway
+#   Look for: Status: Active  (means certificate is provisioned and serving)
+#   Status: Provisioning means DNS is not yet pointing to the LB IP.
+#
+# COMMAND: kubectl apply -f k8s/networking/00-managed-certificate.yaml
+# =============================================================================
+
+apiVersion: networking.gke.io/v1    # GKE-specific API group for networking CRDs
+kind: ManagedCertificate
+metadata:
+  name: mistral-tls-cert             # Referenced in Ingress annotation
+  namespace: mistral-gateway
+
+  labels:
+    app.kubernetes.io/name: mistral-inference-gateway
+    app.kubernetes.io/component: tls-certificate
+    app.kubernetes.io/part-of: mistral-gateway
+
+spec:
+  domains:
+    # WHY a single domain?
+    #   Each domain in the list requires a separate DNS validation probe.
+    #   Start with one domain — add subdomains (e.g., api-v2.example.com)
+    #   later without downtime (Google issues a SAN certificate).
+    #
+    # REPLACE api.example.com with your actual domain BEFORE applying.
+    # The domain must have a DNS A record pointing to the reserved static IP:
+    #   gcloud compute addresses describe mistral-gateway-ip --global
+    - api.example.com

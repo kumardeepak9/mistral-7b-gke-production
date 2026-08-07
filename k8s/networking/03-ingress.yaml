@@ -1,0 +1,168 @@
+# =============================================================================
+# k8s/networking/03-ingress.yaml
+#
+# WHAT IS GKE Ingress?
+#   A Kubernetes Ingress resource that triggers the GKE Ingress Controller to
+#   automatically provision and configure a GCP HTTPS Load Balancer including:
+#     • Global Anycast IP frontend (routes clients to the nearest Google PoP)
+#     • TLS termination (using ManagedCertificate from 00-managed-certificate.yaml)
+#     • HTTP → HTTPS redirect (via FrontendConfig from 01-frontend-config.yaml)
+#     • SSL policy enforcement (TLS 1.2+ with modern cipher suites)
+#     • Cloud Armor WAF (via BackendConfig annotation on fastapi-service)
+#     • Network Endpoint Group (NEG) — routes directly to pod IPs, not node IPs
+#     • Host/path-based routing rules
+#
+# WHY GKE Ingress and not a LoadBalancer Service?
+#   LoadBalancer Service:
+#     • Creates a TCP/UDP Layer 4 load balancer
+#     • No TLS termination, no host routing, no WAF
+#     • One LB per Service = expensive (each LB costs ~$18/month minimum)
+#
+#   GKE Ingress:
+#     • Creates a Layer 7 (HTTP/HTTPS) Application Load Balancer
+#     • TLS termination, host/path routing, WAF, CDN support
+#     • One LB for ALL services → path routing /api → service-a, /v2 → service-b
+#     • Uses NEG (Network Endpoint Groups) for pod-direct load balancing
+#     • Integrates with Cloud Armor, ManagedCertificate, FrontendConfig, BackendConfig
+#
+# NEG (Network Endpoint Group) — WHY it matters:
+#   Traditional LB: Client → LB → kube-proxy on Node → Pod (extra hop)
+#   NEG:            Client → LB → Pod directly (no kube-proxy, lower latency)
+#
+#   NEGs also enable health checking at the pod level (not node level), so
+#   if one pod fails, only that pod is removed from the LB — not the whole node.
+#   Enabled by the `cloud.google.com/neg: '{"ingress": true}'` annotation
+#   on the FastAPI Service (added in Phase 3).
+#
+# STATIC IP PREREQUISITE:
+#   Create the static IP BEFORE applying this Ingress:
+#   gcloud compute addresses create mistral-gateway-ip --global --project=PROJECT_ID
+#   gcloud compute addresses describe mistral-gateway-ip --global (get the IP)
+#   Then add DNS A record: api.example.com → <IP>
+#
+# APPLY ORDER:
+#   1. 00-managed-certificate.yaml
+#   2. 01-frontend-config.yaml
+#   3. 02-backend-config.yaml
+#   4. DNS record configured
+#   5. THIS FILE — kubectl apply -f k8s/networking/03-ingress.yaml
+#
+# COMMAND: kubectl apply -f k8s/networking/03-ingress.yaml
+# VERIFY:  kubectl describe ingress mistral-ingress -n mistral-gateway
+#          (look for: Events: Successfully synced)
+# LB IP:   kubectl get ingress mistral-ingress -n mistral-gateway
+# =============================================================================
+
+apiVersion: networking.k8s.io/v1    # Standard Kubernetes Ingress API
+kind: Ingress
+metadata:
+  name: mistral-ingress
+  namespace: mistral-gateway
+
+  labels:
+    app.kubernetes.io/name: mistral-inference-gateway
+    app.kubernetes.io/component: ingress
+    app.kubernetes.io/part-of: mistral-gateway
+
+  annotations:
+    # ── Ingress class ──────────────────────────────────────────────────────────
+    # WHY kubernetes.io/ingress.class: "gce"?
+    #   "gce" = GKE External HTTPS Load Balancer (Global Anycast).
+    #   "gce-internal" = Internal HTTPS LB (reachable only within VPC).
+    #
+    #   We use "gce" (external) because:
+    #     • API users are on the internet — they need an external IP
+    #     • Google Cloud API Gateway (in front of this Ingress) is external
+    #     • Global Anycast routes users to the nearest Google edge POP
+    #
+    #   NOTE: In GKE clusters with the Gateway API enabled, use
+    #   `ingressClassName: gce` in spec instead. Both work for GKE 1.24+.
+    kubernetes.io/ingress.class: "gce"
+
+    # ── Static IP ─────────────────────────────────────────────────────────────
+    # WHY a static (reserved) IP instead of ephemeral?
+    #   Ephemeral IPs change when the Ingress is deleted and recreated.
+    #   If the IP changes, your DNS A record becomes stale → downtime.
+    #   A reserved static IP persists across Ingress deletions:
+    #     gcloud compute addresses create mistral-gateway-ip --global
+    #   The IP is attached to this Ingress by name — GKE finds it via the annotation.
+    kubernetes.io/ingress.global-static-ip-name: "mistral-gateway-ip"
+
+    # ── ManagedCertificate ────────────────────────────────────────────────────
+    # WHY this annotation?
+    #   Links the ManagedCertificate to this Ingress's HTTPS frontend.
+    #   GKE reads this annotation and installs the certificate on the LB.
+    #   Multiple certificates (for multiple domains) can be listed comma-separated:
+    #     networking.gke.io/managed-certificates: "cert-a,cert-b"
+    networking.gke.io/managed-certificates: "mistral-tls-cert"
+
+    # ── FrontendConfig ────────────────────────────────────────────────────────
+    # WHY this annotation?
+    #   Links the FrontendConfig (HTTPS redirect + SSL policy) to this Ingress.
+    #   The GKE Ingress controller reads this and applies the frontend settings
+    #   to the GCP Load Balancer's forwarding rules.
+    networking.gke.io/v1beta1.FrontendConfig: "fastapi-frontend-config"
+
+spec:
+  # ── Default backend ────────────────────────────────────────────────────────
+  # WHY defaultBackend?
+  #   Handles requests that don't match any rule (e.g., api.example.com/unknown-path).
+  #   Returns a 404 from FastAPI (which has a proper JSON error response handler)
+  #   instead of a GCP LB default 404 page.
+  defaultBackend:
+    service:
+      name: fastapi-service     # Must match Service name in k8s/fastapi/05-service.yaml
+      port:
+        number: 80              # Must match Service port (not containerPort)
+
+  # ── Routing rules ──────────────────────────────────────────────────────────
+  rules:
+    - host: api.example.com      # REPLACE with your actual domain
+      http:
+        paths:
+          # ── Inference API ──────────────────────────────────────────────────
+          # WHY ImplementationSpecific for pathType?
+          #   pathType: Prefix → /v1 matches /v1, /v1/, /v1/chat/completions, etc.
+          #   pathType: Exact → /v1 matches ONLY /v1
+          #   pathType: ImplementationSpecific → GKE Ingress applies GCE URL map
+          #             semantics (prefix match, most-specific wins)
+          #
+          #   We use Prefix for the API paths to route all /v1/* to FastAPI.
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service:
+                name: fastapi-service
+                port:
+                  number: 80
+
+          # ── Health and readiness endpoints ────────────────────────────────
+          # WHY expose /health and /ready via Ingress?
+          #   External monitoring tools (Uptime Checks, Pingdom) need an
+          #   externally reachable health endpoint to verify the API is up.
+          #   The GCP Uptime Check (Phase 7 monitoring) hits /health via the
+          #   public LB IP to detect outages from outside the cluster.
+          - path: /health
+            pathType: Exact
+            backend:
+              service:
+                name: fastapi-service
+                port:
+                  number: 80
+
+          - path: /ready
+            pathType: Exact
+            backend:
+              service:
+                name: fastapi-service
+                port:
+                  number: 80
+
+          # ── Root endpoint (API info) ───────────────────────────────────────
+          - path: /
+            pathType: Exact
+            backend:
+              service:
+                name: fastapi-service
+                port:
+                  number: 80

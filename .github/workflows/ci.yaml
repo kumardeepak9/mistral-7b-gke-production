@@ -1,0 +1,264 @@
+# =============================================================================
+# .github/workflows/ci.yaml — Continuous Integration
+#
+# TRIGGER:
+#   Every pull_request targeting `main`.
+#   Also runs on workflow_dispatch (manual trigger for debugging).
+#
+# PURPOSE:
+#   This workflow acts as a gate before merging to main. All jobs MUST pass
+#   before GitHub will allow a merge (configured via Branch Protection Rules
+#   in Settings → Branches → "Require status checks to pass before merging").
+#
+# JOBS (run in parallel where possible):
+#   1. lint          — Code style enforcement (ruff, black --check)
+#   2. test          — Unit/integration tests with pytest
+#   3. docker-build  — Verify the Dockerfile builds (no push — saves cost + time)
+#   4. security-scan — Filesystem vulnerability scan (Trivy → GitHub Security tab)
+#
+# WHY run these on PR (not on merge to main)?
+#   Catching issues on PR gives the developer immediate feedback and prevents
+#   broken code from ever entering the main branch. The cost of a CI job
+#   (~3 minutes) is far lower than the cost of a failed production deployment.
+#
+# =============================================================================
+
+name: CI — Lint, Test, Security Scan
+
+on:
+  pull_request:
+    # WHY target only main?
+    #   We only enforce CI on PRs to the protected production branch.
+    #   Feature branches can be messy during development.
+    branches:
+      - main
+    # WHY paths filter?
+    #   If a PR only changes documentation (*.md) or infrastructure YAML
+    #   (k8s/**), there's no need to run Python linting or rebuild the Docker image.
+    #   This saves CI minutes and keeps feedback fast.
+    paths:
+      - 'app/**'
+      - 'requirements.txt'
+      - 'Dockerfile'
+      - '.github/workflows/ci.yaml'
+
+  # WHY workflow_dispatch?
+  #   Allows manually triggering CI from the GitHub UI without needing a PR.
+  #   Useful for debugging CI issues or re-running against a specific branch.
+  workflow_dispatch:
+
+# WHY these top-level permissions?
+#   GitHub Actions tokens default to read-only. We explicitly grant only
+#   what this workflow needs. This is the principle of least privilege
+#   applied to CI — a compromised CI job can't push code or modify issues.
+permissions:
+  contents: read          # Check out source code
+  pull-requests: write    # Post lint/test result comments on PR (future enhancement)
+  security-events: write  # Upload Trivy SARIF results to GitHub Security tab
+
+# WHY concurrency group?
+#   If two commits are pushed to the same PR quickly, the first CI run becomes
+#   obsolete. `concurrency` cancels the old run when a new one starts.
+#   cancel-in-progress: true = don't waste CI minutes on stale commits.
+concurrency:
+  group: ci-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ============================================================================
+  # JOB 1: Lint
+  # Enforces consistent code style. Fails if any style violations are found.
+  # Uses ruff (fast Rust-based linter) and black (opinionated formatter).
+  # ============================================================================
+  lint:
+    name: Lint (ruff + black)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        # WHY actions/checkout@v4?
+        #   Checks out the PR branch (not main) so we lint the PR's code.
+        #   v4 uses Node.js 20 — required for modern GitHub Actions runners.
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          # WHY cache: pip?
+          #   Caches the pip download directory between runs.
+          #   The cache is keyed on requirements.txt hash — invalidated when deps change.
+          #   Saves ~30 seconds per run by not re-downloading ruff/black.
+          cache: pip
+
+      - name: Install linting tools
+        # WHY install separately from requirements.txt?
+        #   ruff and black are dev dependencies — not needed at runtime.
+        #   They are not in requirements.txt (which is the production dependency list).
+        #   Keeping them separate prevents bloating the production Docker image.
+        run: pip install ruff==0.6.9 black==24.10.0
+
+      - name: Run ruff (linter)
+        # WHY ruff?
+        #   ruff is a Rust-based Python linter that runs 10-100x faster than
+        #   flake8/pylint. It enforces PEP 8, detects unused imports, undefined
+        #   variables, and hundreds of other rules.
+        #   --output-format=github formats errors as GitHub annotations —
+        #   they appear inline on the PR diff.
+        run: ruff check app/ --output-format=github
+
+      - name: Run black (formatter check)
+        # WHY --check (not --diff)?
+        #   --check: exits non-zero if any file would be reformatted. No changes made.
+        #   --diff: shows the diff but still exits 0. Doesn't fail the CI job.
+        #   We want CI to fail if formatting is wrong — developers must run `black app/`.
+        run: black --check app/
+
+  # ============================================================================
+  # JOB 2: Test
+  # Runs the pytest test suite with coverage reporting.
+  # ============================================================================
+  test:
+    name: Test (pytest)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        # WHY install from requirements.txt (not just test deps)?
+        #   Tests import the actual application code (app/), which imports FastAPI,
+        #   pydantic, httpx, etc. Without production deps, tests fail with ImportError.
+        run: |
+          pip install -r requirements.txt
+          # Test-only dependencies
+          pip install pytest==8.3.4 \
+                      pytest-asyncio==0.24.0 \
+                      httpx==0.28.1 \
+                      pytest-cov==6.0.0
+
+      - name: Run tests with coverage
+        # WHY --cov=app?
+        #   Coverage measures what percentage of app/ code is exercised by tests.
+        #   --cov-report=xml generates coverage.xml for integration with Codecov/SonarQube.
+        #   --cov-fail-under=70 fails CI if coverage drops below 70% — prevents
+        #   merging PRs that add untested code.
+        #   NOTE: Create a tests/ directory with pytest files to activate this step.
+        #   Until tests exist, add `--ignore=tests` or create a placeholder test.
+        run: |
+          if [ -d "tests" ]; then
+            pytest tests/ \
+              --cov=app \
+              --cov-report=xml \
+              --cov-report=term-missing \
+              --cov-fail-under=70 \
+              -v \
+              --tb=short
+          else
+            echo "No tests/ directory found. Skipping pytest."
+            echo "Create tests/ with pytest files to enable coverage enforcement."
+          fi
+
+      - name: Upload coverage report
+        # WHY upload even on failure?
+        #   if: always() ensures coverage.xml is uploaded even if the coverage
+        #   threshold check fails. This allows reviewing what's covered before
+        #   deciding to raise the threshold.
+        if: always() && hashFiles('coverage.xml') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 7
+
+  # ============================================================================
+  # JOB 3: Docker Build Check
+  # Builds the Docker image to verify the Dockerfile is valid.
+  # Does NOT push — only proves the image builds successfully on this PR.
+  # ============================================================================
+  docker-build-check:
+    name: Docker Build Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        # WHY Buildx?
+        #   docker/setup-buildx-action enables BuildKit, which supports:
+        #     • Multi-stage build caching (--cache-from, --cache-to)
+        #     • Faster parallel layer building
+        #     • Better layer caching than classic Docker build
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # WHY push: false?
+          #   This is a CHECK — we only verify the Dockerfile builds without errors.
+          #   Pushing from PR builds is dangerous: the PR might not be reviewed yet.
+          #   Only the CD pipeline (on merge to main) pushes to Artifact Registry.
+          push: false
+          tags: mistral-inference-gateway:pr-check
+          # WHY cache-from/cache-to type=gha?
+          #   GitHub Actions cache stores Docker layer cache between workflow runs.
+          #   On the second PR push: unchanged layers are loaded from cache, not rebuilt.
+          #   A typical 7-layer FastAPI Dockerfile: first build ~3 min, cached ~45 sec.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ============================================================================
+  # JOB 4: Security Scan (Filesystem)
+  # Scans Python dependencies and source code for known CVEs.
+  # Results are uploaded to GitHub's Security tab (Dependabot alerts).
+  # ============================================================================
+  security-scan:
+    name: Security Scan (Trivy)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy filesystem scan
+        # WHY Trivy?
+        #   Trivy is the industry-standard OSS vulnerability scanner for containers.
+        #   It scans Python packages (requirements.txt), OS packages, and IaC files.
+        #   Alternative: Snyk (better remediation advice, paid for team features).
+        #
+        # WHY format: sarif?
+        #   SARIF (Static Analysis Results Interchange Format) is the standard
+        #   format GitHub's Security tab understands. Using SARIF means results
+        #   appear inline on the PR diff as "code scanning alerts."
+        #
+        # WHY severity: HIGH,CRITICAL (not MEDIUM)?
+        #   MEDIUM vulnerabilities are typically theoretical or require specific
+        #   exploit conditions. Failing CI on every MEDIUM would create noise.
+        #   HIGH and CRITICAL have confirmed exploits or severe CVSS scores (7.0+).
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs-results.sarif
+          severity: HIGH,CRITICAL
+          # WHY exit-code: 0 (not 1)?
+          #   On filesystem scan (not container scan), we upload results for
+          #   visibility but don't block the PR — some CVEs are in transitive
+          #   dependencies we can't immediately fix. The CD pipeline's image
+          #   scan (which we CAN fix) uses exit-code: 1.
+          exit-code: "0"
+
+      - name: Upload scan results to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs-results.sarif
+          category: trivy-filesystem

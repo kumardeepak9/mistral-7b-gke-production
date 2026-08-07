@@ -1,0 +1,401 @@
+# =============================================================================
+# k8s/fastapi/04-deployment.yaml
+#
+# WHY Deployment and not StatefulSet or DaemonSet?
+#   • Deployment — stateless, horizontally scalable, rolling-update capable.
+#     FastAPI is stateless (no local disk state, no sticky sessions). ✓
+#   • StatefulSet — for stateful apps that need stable network IDs or PVCs
+#     (e.g., databases). Not needed here.
+#   • DaemonSet — runs one pod per node. Not needed here.
+#
+# This Deployment matches Diagram 1: "FastAPI Deployment (2-3 Pods)"
+#
+# APPLY ORDER: Requires Namespace (00), ConfigMap (01), Secret (02),
+#              and ServiceAccount (03) to exist first.
+#
+# COMMAND: kubectl apply -f k8s/fastapi/04-deployment.yaml
+# ROLLOUT:  kubectl rollout status deployment/fastapi -n mistral-gateway
+# =============================================================================
+
+apiVersion: apps/v1       # Deployment is in the apps API group, not core (v1)
+kind: Deployment
+metadata:
+  name: fastapi             # Used by: kubectl get deployment fastapi -n mistral-gateway
+  namespace: mistral-gateway
+
+  labels:
+    # Standard Kubernetes recommended labels.
+    # These labels go on the Deployment object itself — used for grouping in
+    # dashboards and `kubectl get deployment -l app.kubernetes.io/name=...`
+    app.kubernetes.io/name: mistral-inference-gateway
+    app.kubernetes.io/component: api-gateway
+    app.kubernetes.io/part-of: mistral-gateway
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: kubectl   # Will change to "Helm" or "ArgoCD" in Phase 5
+
+spec:
+  # ── Replica count ────────────────────────────────────────────────────────────
+  # WHY 2 replicas?
+  #   • Availability: if one pod is evicted or crashes, the other still serves.
+  #   • Rolling updates: Kubernetes can terminate one pod and bring up the new
+  #     one without downtime (maxUnavailable: 1 in strategy below).
+  #   • Diagram 1 says "2-3 pods" — 2 is the baseline, HPA (Phase 5) scales to 3.
+  replicas: 2
+  revisionHistoryLimit: 5
+  minReadySeconds: 10
+  progressDeadlineSeconds: 600
+
+  # ── Selector ─────────────────────────────────────────────────────────────────
+  # WHY selector is separate from template.metadata.labels?
+  #   selector is IMMUTABLE after creation. It defines which Pods this Deployment
+  #   owns. template.metadata.labels can have additional labels for filtering.
+  #   Both must share at least the labels in selector.matchLabels.
+  selector:
+    matchLabels:
+      app: fastapi                  # The Service uses this same label to route traffic
+
+  # ── Update strategy ──────────────────────────────────────────────────────────
+  strategy:
+    type: RollingUpdate             # Replace pods gradually, never all at once
+    rollingUpdate:
+      # WHY maxUnavailable: 0?
+      #   Never take a pod out of service before a new one is Ready.
+      #   This is zero-downtime deployment. The trade-off: during rollout,
+      #   you temporarily have replicas+1 pods running (costs slightly more).
+      maxUnavailable: 0
+
+      # WHY maxSurge: 1?
+      #   Allow 1 extra pod above `replicas` during rollout. With replicas=2,
+      #   rollout creates pod 3, waits for Ready, terminates pod 1, creates pod 4,
+      #   waits for Ready, terminates pod 2. Total 3 pods at peak — manageable.
+      maxSurge: 1
+
+  # ── Pod template ─────────────────────────────────────────────────────────────
+  # Everything under `template` defines the pods that this Deployment creates.
+  template:
+    metadata:
+      labels:
+        # These labels MUST include selector.matchLabels (app: fastapi).
+        # The Service in 05-service.yaml also selects on `app: fastapi`.
+        app: fastapi
+        app.kubernetes.io/name: mistral-inference-gateway
+        app.kubernetes.io/component: api-gateway
+        app.kubernetes.io/part-of: mistral-gateway
+        app.kubernetes.io/version: "0.1.0"
+
+      annotations:
+        # Prometheus scraping annotations — tells the Prometheus ServiceMonitor
+        # (Diagram 3) to scrape metrics from this pod on port 8000 at /metrics.
+        # The /metrics endpoint will be added in a later phase (prometheus-client).
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+
+    spec:
+      # ── Service Account ─────────────────────────────────────────────────────
+      # WHY specify serviceAccountName?
+      #   Links the pod to the dedicated SA in 03-serviceaccount.yaml.
+      #   Without this, pods use the "default" SA — a security anti-pattern.
+      serviceAccountName: fastapi-sa
+
+      # WHY automountServiceAccountToken: false here too?
+      #   Belt-and-suspenders. The SA itself has it disabled, but the Deployment
+      #   can override that. Setting it false here ensures no token is mounted
+      #   regardless of SA defaults.
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+
+      # ── Pod-level security context ───────────────────────────────────────────
+      # WHY securityContext at the pod level?
+      #   Pod-level settings apply to ALL containers in the pod and to volumes.
+      #   Container-level settings (below) apply only to that specific container.
+      securityContext:
+        # WHY runAsNonRoot: true?
+        #   Kubernetes will refuse to start the container if the image's USER is root.
+        #   Matches our Dockerfile `USER appuser` (UID 1001).
+        runAsNonRoot: true
+
+        # WHY runAsUser/runAsGroup: 1001?
+        #   Must match the UID/GID created in the Dockerfile:
+        #     useradd --uid 1001 --gid 1001 appuser
+        #   This is enforced by the PSS policy on the namespace.
+        runAsUser: 1001
+        runAsGroup: 1001
+
+        # WHY fsGroup: 1001?
+        #   When Kubernetes mounts a volume into a pod, it chowns the volume's
+        #   root directory to fsGroup. Ensures the appuser process can write to
+        #   mounted volumes (e.g., the tmpfs /tmp mount below).
+        fsGroup: 1001
+
+        # WHY seccompProfile: RuntimeDefault?
+        #   seccomp filters system calls the container can make.
+        #   RuntimeDefault uses the container runtime's default profile (Docker/containerd)
+        #   which blocks ~40 dangerous syscalls (e.g., ptrace, reboot, kexec_load).
+        #   Required by PSS "restricted" policy and CIS Benchmark 5.7.2.
+        seccompProfile:
+          type: RuntimeDefault
+
+      # ── Topology spread ─────────────────────────────────────────────────────
+      # WHY topologySpreadConstraints?
+      #   Without this, Kubernetes might schedule both replicas on the same node
+      #   or same availability zone. If that node or zone fails, both pods go down.
+      #   This constraint ensures pods are spread across zones.
+      topologySpreadConstraints:
+        - maxSkew: 1                          # Max difference in pod count between zones
+          topologyKey: topology.kubernetes.io/zone   # Spread across GCP availability zones
+          whenUnsatisfiable: DoNotSchedule    # Refuse scheduling if constraint can't be met
+          labelSelector:
+            matchLabels:
+              app: fastapi                    # Count pods with this label
+
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: fastapi
+                topologyKey: kubernetes.io/hostname
+            - weight: 50
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: fastapi
+                topologyKey: topology.kubernetes.io/zone
+
+      # ── Termination grace period ─────────────────────────────────────────────
+      # WHY 30 seconds?
+      #   When Kubernetes sends SIGTERM (pod deletion / rolling update), it waits
+      #   this many seconds for the process to exit before sending SIGKILL.
+      #   Uvicorn handles SIGTERM and finishes in-flight requests within ~5s.
+      #   30s provides generous headroom for long inference requests.
+      terminationGracePeriodSeconds: 30
+
+      # ── Containers ──────────────────────────────────────────────────────────
+      containers:
+        - name: fastapi   # Container name — used in `kubectl logs fastapi/<pod> -c fastapi`
+
+          # ── Image ────────────────────────────────────────────────────────────
+          # WHY use Artifact Registry path?
+          #   GKE has native auth to GCP Artifact Registry in the same project.
+          #   No imagePullSecret needed. Replace PROJECT_ID and REGION.
+          # Format: <region>-docker.pkg.dev/<project>/<repo>/<image>:<tag>
+          # Example: us-central1-docker.pkg.dev/my-project/mistral-repo/mistral-inference-gateway:0.1.0
+          image: REGION-docker.pkg.dev/PROJECT_ID/mistral-repo/mistral-inference-gateway:0.1.0
+
+          # WHY IfNotPresent and not Always?
+          #   Always re-pulls on every pod start — slow and network-intensive.
+          #   IfNotPresent uses the cached image if the tag already exists on the node.
+          #   In production, use immutable tags (SHA digest or semver) so the tag
+          #   uniquely identifies the image. Never use `latest` in production.
+          imagePullPolicy: IfNotPresent
+
+          # ── Container port ────────────────────────────────────────────────────
+          ports:
+            - name: http              # Named ports allow Service targetPort to use the name
+              containerPort: 8000     # Must match PORT in ConfigMap and EXPOSE in Dockerfile
+              protocol: TCP
+
+          # ── Environment from ConfigMap and Secret ─────────────────────────────
+          # WHY envFrom instead of individual env entries?
+          #   envFrom injects ALL keys from a ConfigMap/Secret as env vars in one block.
+          #   Adding a new config key only requires updating the ConfigMap — not this file.
+          #   Individual `env` entries are used for values derived from pod metadata
+          #   (see the Downward API entries below).
+          envFrom:
+            - configMapRef:
+                name: fastapi-config        # All keys from 01-configmap.yaml
+            - secretRef:
+                name: fastapi-secrets       # All keys from 02-secret.yaml
+
+          # ── Downward API env vars ─────────────────────────────────────────────
+          # WHY: These values are known only at runtime (Kubernetes assigns them).
+          #      They are injected into the container via the Downward API so the
+          #      app can include pod_name and node_name in log lines — essential for
+          #      debugging multi-pod issues in Cloud Logging.
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name           # e.g., fastapi-6d9f8b7c4-xk2p9
+
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace      # mistral-gateway
+
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName           # e.g., gke-cluster-pool-abc123
+
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP            # Pod's cluster IP
+
+          # ── Resource requests and limits ──────────────────────────────────────
+          # WHY both requests AND limits?
+          #   requests: Used by the scheduler to find a node with enough free capacity.
+          #             The pod is GUARANTEED these resources.
+          #   limits:   The hard ceiling. If the container exceeds CPU limit, it is
+          #             throttled. If it exceeds memory limit, it is OOMKilled.
+          #
+          # WHY these specific values?
+          #   FastAPI (without GPU) is primarily I/O bound — waiting on vLLM responses.
+          #   CPU: 250m request (1/4 core) handles concurrent I/O. 1000m limit allows
+          #        bursting during startup or heavy JSON serialization.
+          #   Memory: 256Mi handles FastAPI + pydantic + httpx connection pool.
+          #           512Mi limit provides headroom for large response bodies.
+          #
+          # QoS class with these settings: Burstable
+          #   (requests < limits → Burstable; requests = limits → Guaranteed)
+          #   Guaranteed is preferred for latency-sensitive workloads — consider
+          #   setting requests=limits in a future tuning phase.
+          resources:
+            requests:
+              cpu: "250m"       # 250 millicores = 0.25 vCPU
+              memory: "256Mi"   # 256 Mebibytes
+              ephemeral-storage: "256Mi"
+            limits:
+              cpu: "1000m"      # 1000 millicores = 1.0 vCPU (4× burst headroom)
+              memory: "512Mi"   # 512 Mebibytes
+              ephemeral-storage: "512Mi"
+
+          # ── Liveness probe ────────────────────────────────────────────────────
+          # WHY liveness probe?
+          #   Detects a deadlocked or corrupted process. If the probe fails
+          #   `failureThreshold` times consecutively, kubelet RESTARTS the container.
+          #
+          # WHY /health and not /?
+          #   /health is intentionally lightweight (no I/O, no downstream calls).
+          #   / triggers the full root handler — adds unnecessary overhead on
+          #   every probe cycle (every 15 seconds × N pods).
+          #
+          # Timing rationale:
+          #   initialDelaySeconds: 10  → Uvicorn takes ~3-5s to start. 10s is safe.
+          #   periodSeconds: 15        → Check every 15s. Fast enough to detect
+          #                              deadlocks without excessive probe traffic.
+          #   timeoutSeconds: 5        → Probe fails if /health doesn't respond in 5s.
+          #                              The handler has no I/O so 5s is generous.
+          #   failureThreshold: 3      → 3 consecutive failures → restart.
+          #                              = 45 seconds of failure before restart.
+          #                              Prevents restart loops from transient hiccups.
+          #   successThreshold: 1      → One success clears the failure count.
+          #                              (successThreshold must be 1 for liveness probes)
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http            # Uses the named port `http` (8000) defined above
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+
+          # ── Readiness probe ───────────────────────────────────────────────────
+          # WHY readiness probe?
+          #   Determines if the pod should receive traffic from the Service.
+          #   If the probe fails, the pod's IP is removed from the Service's
+          #   Endpoints list — no new requests are routed to it. The pod is NOT
+          #   restarted (that's liveness). Used for:
+          #     • Graceful startup (don't send traffic until the app is initialised)
+          #     • Graceful shutdown (stop traffic before SIGTERM is processed)
+          #     • Dependency failures (e.g., if we add a vLLM reachability check)
+          #
+          # WHY different timing from liveness?
+          #   initialDelaySeconds: 5   → Check sooner than liveness (5s vs 10s) to
+          #                              start serving traffic as quickly as possible.
+          #   periodSeconds: 10        → Check more frequently than liveness (10s vs 15s)
+          #                              so degraded pods are removed from rotation faster.
+          #   failureThreshold: 3      → 30s of failure before pod is pulled from rotation.
+          #   successThreshold: 1      → One success re-adds the pod to rotation.
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+
+          # ── Startup probe ─────────────────────────────────────────────────────
+          # WHY startupProbe?
+          #   Protects slow-starting containers from being killed by liveness probe
+          #   before they finish initialising. The startup probe DISABLES liveness
+          #   and readiness probes until it succeeds.
+          #   FastAPI starts in ~5s but if the node is cold (image not cached),
+          #   it may take longer. startupProbe gives up to 60s (12 × 5s) before
+          #   giving up — without affecting steady-state liveness probe frequency.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 5          # Check every 5s during startup
+            timeoutSeconds: 5
+            failureThreshold: 12      # 12 × 5s = 60 seconds max startup time
+            successThreshold: 1
+
+          # ── Container-level security context ──────────────────────────────────
+          securityContext:
+            # WHY allowPrivilegeEscalation: false?
+            #   Prevents the process from gaining more privileges than its parent
+            #   (e.g., via setuid binaries). Required by CIS Benchmark 5.2.5.
+            allowPrivilegeEscalation: false
+
+            # WHY readOnlyRootFilesystem: true?
+            #   Makes the container filesystem read-only. If an attacker exploits
+            #   the app and tries to write a backdoor or exfiltrate data via the
+            #   filesystem, they cannot. We tested this with docker-compose.yml
+            #   in Phase 2 (read_only: true + tmpfs mounts).
+            #   PYTHONDONTWRITEBYTECODE=1 in the Dockerfile prevents .pyc write errors.
+            readOnlyRootFilesystem: true
+
+            # WHY drop ALL capabilities?
+            #   Linux capabilities (NET_ADMIN, SYS_PTRACE, etc.) are process-level
+            #   permissions. A web server needs zero capabilities. Dropping all
+            #   means even if the process is compromised, it cannot bind ports < 1024,
+            #   modify network interfaces, or trace other processes.
+            #   Required by CIS Benchmark 5.2.7.
+            capabilities:
+              drop:
+                - ALL
+
+          # ── Volume mounts ─────────────────────────────────────────────────────
+          # WHY tmpfs mounts?
+          #   readOnlyRootFilesystem: true blocks ALL writes including /tmp.
+          #   Python's tempfile module, Uvicorn's IPC, and httpx may write to /tmp.
+          #   We mount an in-memory tmpfs volume so writes succeed without
+          #   compromising the read-only guarantee on the rest of the filesystem.
+          volumeMounts:
+            - name: tmp-volume
+              mountPath: /tmp
+            - name: var-tmp-volume
+              mountPath: /var/tmp
+
+      # ── Volumes ───────────────────────────────────────────────────────────────
+      # WHY emptyDir with medium: Memory?
+      #   emptyDir is ephemeral — created when the pod starts, deleted when it ends.
+      #   medium: Memory uses tmpfs (RAM-backed) instead of the node's disk.
+      #   tmpfs is:
+      #     • Fast (RAM-speed reads/writes)
+      #     • Never written to the container's overlay filesystem
+      #     • Not visible to other pods
+      #   sizeLimit prevents a runaway process from consuming all node memory.
+      volumes:
+        - name: tmp-volume
+          emptyDir:
+            medium: Memory
+            sizeLimit: "64Mi"    # Max 64 MiB of RAM for /tmp
+
+        - name: var-tmp-volume
+          emptyDir:
+            medium: Memory
+            sizeLimit: "16Mi"    # Max 16 MiB of RAM for /var/tmp

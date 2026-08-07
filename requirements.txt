@@ -1,0 +1,29 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# requirements.txt
+#
+# WHY: Pinned versions prevent silent breakage in production builds.
+#      Every dependency here has a hard version so the Docker image is
+#      deterministic and reproducible across CI and production.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Web framework
+fastapi==0.115.5
+
+# ASGI server — production-grade, replaces dev's `uvicorn[standard]`
+uvicorn[standard]==0.32.1
+
+# Pydantic v2 — used by FastAPI for request validation and by Settings for config
+# 2.11+ ships pre-built wheels for Python 3.14 (avoids Rust/PyO3 build on local dev)
+pydantic==2.11.7
+
+# pydantic-settings — reads environment variables into typed Python objects
+pydantic-settings==2.10.1
+
+# HTTP client — used by the inference router to proxy requests to vLLM
+httpx==0.28.1
+
+# Structured JSON logging
+python-json-logger==3.2.1
+
+# Python-dotenv — loads .env files in local development only
+python-dotenv==1.0.1

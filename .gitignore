@@ -1,0 +1,33 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# .gitignore
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Python artefacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local secrets — never committed
+.env
+
+# Test artefacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# OS artefacts
+.DS_Store
+Thumbs.db

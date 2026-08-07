@@ -1,0 +1,14 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: fastapi-pdb
+  namespace: mistral-gateway
+  labels:
+    app.kubernetes.io/name: mistral-inference-gateway
+    app.kubernetes.io/component: pdb
+    app.kubernetes.io/part-of: mistral-gateway
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: fastapi

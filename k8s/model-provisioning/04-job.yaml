@@ -1,0 +1,403 @@
+# =============================================================================
+# k8s/model-provisioning/04-job.yaml
+#
+# WHY Kubernetes Job and not a Deployment or CronJob?
+#
+#   Deployment:  Long-running service (always-on, restarts on exit). Wrong for
+#                a one-time download that completes and should stop.
+#
+#   CronJob:     Runs on a schedule (every hour, every day). Wrong for a task
+#                that runs once when provisioning a new cluster.
+#
+#   Job:         Runs to completion — exactly N successful pod completions required,
+#                then the Job is "done." Ideal for:
+#                  • Database migrations
+#                  • Data processing pipelines
+#                  • Model downloads ← our use case
+#
+# WHAT THIS JOB DOES (3 steps):
+#
+#   Step 1: Install dependencies at runtime (pip install)
+#     WHY at runtime? The job uses python:3.12-slim (our standard base image)
+#     to avoid maintaining a separate provisioning Docker image. The pip install
+#     adds ~2 minutes but saves a dedicated image build pipeline.
+#     PRODUCTION ALTERNATIVE: Build a custom `mistral-downloader:v1.0` image
+#     with pre-installed deps for faster Job startup.
+#
+#   Step 2: Download Mistral-7B-Instruct-v0.3 from Hugging Face
+#     Uses `huggingface-cli download` with HF_TOKEN (from Secret 01-secret.yaml).
+#     Downloads ~14.5 GB of safetensors files to node's ephemeral storage (/workspace).
+#     WHY /workspace not /models? Writing to GCS Fuse can be slow for large files
+#     (FUSE write path has overhead). Downloading to local SSD first, then
+#     uploading to GCS via gcloud storage is significantly faster.
+#
+#   Step 3: Upload to GCS bucket
+#     Uses `gcloud storage cp` (parallel multi-threaded upload) to transfer
+#     the model from node ephemeral storage to GCS.
+#     Authenticated via Workload Identity (model-download-sa → model-download-gsa).
+#     After this step, the model is permanently stored in GCS.
+#     The vLLM Deployment reads from GCS via the GCS Fuse PVC (model-pvc).
+#
+# ESTIMATED RUNTIME:
+#   pip install:     ~2-3 minutes
+#   HF download:     ~20-40 minutes (depends on cluster egress bandwidth)
+#   gcloud upload:   ~5-15 minutes (parallel upload, GCS write bandwidth)
+#   Total:           ~30-60 minutes
+#
+# IDEMPOTENCY:
+#   Running this Job twice will overwrite the model files in GCS.
+#   This is safe — model files are deterministic for the same model version.
+#   To re-run: delete the completed Job and re-apply:
+#     kubectl delete job model-downloader -n mistral-gateway
+#     kubectl apply -f k8s/model-provisioning/04-job.yaml
+#
+# APPLY ORDER:
+#   1. 00-serviceaccount.yaml must exist (model-download-sa)
+#   2. 01-secret.yaml must exist (hf-token-secret)
+#   3. GCS bucket must exist (created by Terraform, Phase 6)
+#   4. Then apply this Job
+#
+# COMMAND: kubectl apply -f k8s/model-provisioning/04-job.yaml
+# MONITOR:  kubectl logs -f job/model-downloader -n mistral-gateway
+# STATUS:   kubectl get job model-downloader -n mistral-gateway
+# =============================================================================
+
+apiVersion: batch/v1   # Job and CronJob live in the batch API group
+kind: Job
+metadata:
+  name: model-downloader
+  namespace: mistral-gateway
+
+  labels:
+    app.kubernetes.io/name: model-provisioning
+    app.kubernetes.io/component: job
+    app.kubernetes.io/part-of: mistral-gateway
+    model: mistral-7b-instruct-v0.3
+
+spec:
+  # ── Completion policy ────────────────────────────────────────────────────────
+  # WHY completions: 1?
+  #   We need exactly one successful model download. There's no benefit to
+  #   running multiple parallel downloads — GCS is a single write target.
+  completions: 1
+
+  # WHY parallelism: 1?
+  #   One pod runs at a time. Running multiple pods in parallel would cause
+  #   concurrent uploads to GCS (safe, as GCS is eventually consistent) but
+  #   would also consume 2× the ephemeral storage and bandwidth — wasteful.
+  parallelism: 1
+
+  # ── Retry policy ─────────────────────────────────────────────────────────────
+  # WHY backoffLimit: 3?
+  #   Network failures during a 14 GB download are realistic (DNS timeout,
+  #   Hugging Face rate limiting, GCS API transient errors). backoffLimit: 3
+  #   means Kubernetes will retry up to 3 times before marking the Job failed.
+  #   Each retry starts a fresh pod with a clean workspace.
+  #   If 3 retries all fail, the Job status becomes "Failed" — triggering a
+  #   PagerDuty alert (Phase 6 monitoring) and requiring manual investigation.
+  backoffLimit: 3
+
+  # ── TTL after completion ──────────────────────────────────────────────────────
+  # WHY ttlSecondsAfterFinished: 86400?
+  #   After the Job succeeds, Kubernetes auto-deletes the Job (and its pods)
+  #   after 24 hours (86400 seconds). This:
+  #     • Keeps the namespace clean — old Job pods don't accumulate
+  #     • Preserves logs for 24 hours for post-run audit
+  #     • Does NOT delete the GCS data (the Job only uploads — data lives in GCS)
+  #   Set to 0 for immediate cleanup, or remove to keep the Job forever.
+  ttlSecondsAfterFinished: 86400
+
+  # ── Active deadline ───────────────────────────────────────────────────────────
+  # WHY activeDeadlineSeconds: 7200?
+  #   If the download gets stuck (e.g., Hugging Face is down, network partition),
+  #   the Job will wait forever without this limit. 7200 seconds (2 hours) is
+  #   generous for a 14 GB download + upload. After 2 hours, Kubernetes kills
+  #   the pod and marks the Job "DeadlineExceeded" — a clear failure signal.
+  activeDeadlineSeconds: 7200
+
+  template:
+    metadata:
+      labels:
+        app: model-downloader
+        app.kubernetes.io/name: model-provisioning
+
+    spec:
+      # ── Restart policy ───────────────────────────────────────────────────────
+      # WHY OnFailure (not Never or Always)?
+      #   Never:     Pod fails → Job creates a NEW pod (up to backoffLimit).
+      #              Logs from the failed pod are preserved. Good for debugging.
+      #   OnFailure: Same pod is restarted on the same node. Logs are lost.
+      #              Not ideal for download jobs (workspace may be corrupted).
+      #   Always:    Wrong for Jobs — pod would restart even after success.
+      #
+      #   We use Never: each retry gets a fresh pod and clean /workspace.
+      #   This ensures no corrupted partial download from a previous attempt.
+      restartPolicy: Never
+
+      serviceAccountName: model-download-sa   # Has GCS objectAdmin via Workload Identity
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+
+      # ── Pod-level security context ───────────────────────────────────────────
+      securityContext:
+        # This job installs OS packages at runtime (apt-get), which requires root.
+        # For production, move dependencies to a prebuilt image and restore non-root.
+        runAsNonRoot: false
+        seccompProfile:
+          type: RuntimeDefault
+
+      # ── Node placement ────────────────────────────────────────────────────────
+      # WHY run the download Job on CPU nodes, not GPU nodes?
+      #   GPU nodes are expensive and scarce. The download Job does not need a GPU —
+      #   it only needs fast network I/O and disk I/O. Scheduling it on CPU nodes:
+      #     • Saves GPU node capacity for vLLM inference
+      #     • CPU nodes (n2-standard-4) have fast network (10 Gbps) for GCS upload
+      #     • The Job completes faster on a CPU node dedicated to I/O work
+      nodeSelector:
+        # Target the default CPU node pool (not the GPU pool)
+        # Replace `default-pool` with your actual CPU node pool name
+        cloud.google.com/gke-nodepool: default-pool
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: cloud.google.com/gke-accelerator
+                    operator: DoesNotExist
+
+      # ── Main container ────────────────────────────────────────────────────────
+      containers:
+        - name: model-downloader
+
+          # WHY python:3.12-slim?
+          #   Consistent with our FastAPI image base.
+          #   Contains pip for installing huggingface-hub.
+          #   google-cloud-sdk is installed by the bootstrap command below.
+          #   ALTERNATIVE for production: pre-build a custom image with all deps.
+          image: python:3.12-slim
+          imagePullPolicy: IfNotPresent
+
+          # ── Download and upload command ───────────────────────────────────────
+          # WHY command + args (exec form) instead of shell script?
+          #   The shell: ["/bin/bash", "-c"] approach allows us to write a
+          #   multi-step script inline. `set -euo pipefail` ensures:
+          #     set -e: exit immediately if any command fails
+          #     set -u: treat unset variables as errors
+          #     set -o pipefail: pipe failures propagate correctly
+          #   Without these flags, a failed `pip install` would silently continue
+          #   to the download step, producing a confusing error.
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              echo "=========================================="
+              echo "  Mistral-7B-Instruct-v0.3 Provisioning"
+              echo "  Pod: ${POD_NAME}"
+              echo "  Node: ${NODE_NAME}"
+              echo "  Target: gs://${GCS_BUCKET}/mistral-7b-instruct/"
+              echo "=========================================="
+
+              # ── Step 1: Install dependencies ───────────────────────────────
+              echo "[1/3] Installing huggingface-hub and gcloud SDK..."
+
+              # Install Hugging Face CLI for model download
+              pip install --quiet --no-cache-dir \
+                "huggingface-hub[cli]==0.26.5"
+
+              # Install Google Cloud SDK (includes gcloud storage for parallel upload)
+              # WHY apt-get not pip? gcloud CLI is not a Python package.
+              # WHY --no-install-recommends? Saves ~200MB of recommended packages.
+              apt-get update -qq \
+                && apt-get install -y --no-install-recommends \
+                    apt-transport-https \
+                    ca-certificates \
+                    gnupg \
+                    curl \
+                && curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+                    | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
+                && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] \
+                    https://packages.cloud.google.com/apt cloud-sdk main" \
+                    > /etc/apt/sources.list.d/google-cloud-sdk.list \
+                && apt-get update -qq \
+                && apt-get install -y --no-install-recommends google-cloud-cli \
+                && rm -rf /var/lib/apt/lists/*
+
+              echo "[1/3] Dependencies installed."
+
+              # ── Step 2: Download model from Hugging Face ────────────────────
+              echo "[2/3] Downloading Mistral-7B-Instruct-v0.3 from Hugging Face..."
+              echo "      Destination: /workspace/mistral-7b-instruct"
+              echo "      Estimated size: ~14.5 GB. This may take 20-40 minutes."
+
+              # WHY --local-dir-use-symlinks False?
+              #   By default, huggingface-cli creates symlinks pointing to the
+              #   Hugging Face cache (~/.cache/huggingface/hub/...).
+              #   We want real files, not symlinks, so gcloud can upload actual bytes.
+              #   False = copy files to local-dir without symlinking.
+              #
+              # WHY --include "*.safetensors,*.json,*.txt,tokenizer*"?
+              #   We only need the model weights and tokenizer files.
+              #   Excluding Jupyter notebooks, README.md, LICENSE saves ~100 MB.
+              huggingface-cli download \
+                mistralai/Mistral-7B-Instruct-v0.3 \
+                --local-dir /workspace/mistral-7b-instruct \
+                --local-dir-use-symlinks False \
+                --token "${HF_TOKEN}"
+
+              echo "[2/3] Download complete. Verifying files..."
+              ls -lh /workspace/mistral-7b-instruct/
+              du -sh /workspace/mistral-7b-instruct/
+
+              # ── Step 3: Upload to GCS bucket ─────────────────────────────────
+              echo "[3/3] Uploading to gs://${GCS_BUCKET}/mistral-7b-instruct/..."
+              echo "      Workload Identity SA: ${GOOGLE_SERVICE_ACCOUNT}"
+              echo "      Estimated upload time: 5-15 minutes."
+
+              # WHY gcloud storage cp instead of gsutil?
+              #   `gcloud storage` is the modern replacement for gsutil.
+              #   It uses gRPC and parallel composite uploads by default —
+              #   up to 8x faster for large files than sequential gsutil.
+              #   It authenticates via Workload Identity automatically (no gcloud auth login needed).
+              #
+              # WHY --recursive?
+              #   The model directory contains multiple subdirectories and files.
+              #   --recursive copies the entire directory tree.
+              #
+              # WHY --no-clobber is NOT used?
+              #   We want to overwrite any partial uploads from a previous failed run.
+              #   A complete re-upload ensures consistency.
+              gcloud storage cp \
+                --recursive \
+                /workspace/mistral-7b-instruct/ \
+                "gs://${GCS_BUCKET}/mistral-7b-instruct/"
+
+              echo "=========================================="
+              echo "  Upload complete! Verifying GCS contents..."
+              gcloud storage ls -l "gs://${GCS_BUCKET}/mistral-7b-instruct/" | tail -5
+              echo ""
+              echo "  SUCCESS: Mistral-7B-Instruct-v0.3 is now in GCS."
+              echo "  vLLM pods can now start and mount model-pvc."
+              echo "  You may delete this Job: kubectl delete job model-downloader -n mistral-gateway"
+              echo "=========================================="
+
+          # ── Environment variables ─────────────────────────────────────────────
+          env:
+            # HF_TOKEN from Secret — authorises download of the gated model
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret      # Created in 01-secret.yaml
+                  key: HF_TOKEN
+
+            # GCS bucket name — where the model will be uploaded.
+            # Replace PROJECT_ID-mistral-models with your actual bucket name.
+            # The bucket must already exist (created by Terraform, Phase 6).
+            - name: GCS_BUCKET
+              value: "PROJECT_ID-mistral-models"
+
+            # For logging — which GCP SA is being used via Workload Identity
+            - name: GOOGLE_SERVICE_ACCOUNT
+              value: "model-download-gsa@PROJECT_ID.iam.gserviceaccount.com"
+
+            # Hugging Face caches and temp files — keep in the writable workspace
+            - name: HF_HOME
+              value: "/workspace/.hf-home"
+
+            - name: TRANSFORMERS_CACHE
+              value: "/workspace/.hf-cache"
+
+            # Downward API — pod identity for log correlation
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+
+          # ── Resource requests and limits ──────────────────────────────────────
+          resources:
+            requests:
+              # WHY 2 CPU?
+              #   huggingface-cli uses async downloading (multiple chunks in parallel).
+              #   gcloud storage cp uses parallel composite uploads.
+              #   2 vCPUs ensures these parallel operations don't starve each other.
+              cpu: "2"
+
+              # WHY 4Gi memory?
+              #   huggingface-hub buffers download chunks in memory.
+              #   gcloud storage uses upload buffers.
+              #   4 Gi covers both without OOMKill risk.
+              memory: "4Gi"
+
+              # WHY ephemeral-storage: 30Gi?
+              #   The model download lands in /workspace (node ephemeral storage).
+              #   Mistral-7B safetensors: ~14.5 GB
+              #   Hugging Face cache: ~14.5 GB (cached copy in HF_HOME)
+              #   OS/pip overhead: ~3 GB
+              #   Total: ~32 GB. We request 30 Gi (cache shares some space with dl).
+              #
+              #   WHY ephemeral-storage matters:
+              #     Without this request, the scheduler doesn't know the pod needs
+              #     large disk space. The pod might land on a node with only 10 GB
+              #     free, fill the disk, and get evicted with:
+              #     "Evicted: The node was low on resource: ephemeral-storage"
+              #     Requesting 30 Gi ensures the pod only lands on nodes with
+              #     enough disk space. GKE CPU nodes (n2-standard-4) typically
+              #     have 100 GB boot disk — sufficient.
+              ephemeral-storage: "30Gi"
+
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+              ephemeral-storage: "50Gi"   # Hard limit — pod evicted if exceeded
+
+          # ── Container security context ─────────────────────────────────────────
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false   # pip install and apt-get need write access
+            capabilities:
+              drop:
+                - ALL
+
+          # ── Volume mounts ─────────────────────────────────────────────────────
+          volumeMounts:
+            # WHY /workspace as a dedicated volume?
+            #   The model download (14.5 GB) must land somewhere writable and large.
+            #   Option A: Node ephemeral storage (ephemeral-storage limit above)
+            #   Option B: A dedicated emptyDir volume (this approach)
+            #
+            #   We use emptyDir WITHOUT medium: Memory because:
+            #     • Memory-backed tmpfs can't hold 14 GB (node RAM is typically 16-32 GB)
+            #     • Disk-backed emptyDir uses node ephemeral storage (fast SSD on GKE nodes)
+            #     • emptyDir is cleaned up automatically when the pod terminates
+            #   This is the scratch space for: model download + HF cache + gcloud upload buffer
+            - name: workspace
+              mountPath: /workspace
+
+            # /tmp for pip, apt, and system temp operations
+            - name: tmp
+              mountPath: /tmp
+
+      # ── Volumes ────────────────────────────────────────────────────────────────
+      volumes:
+        # WHY emptyDir (not memory-backed)?
+        #   We need 30+ GB for the model download. Node SSD is the only option.
+        #   emptyDir (disk-backed) uses node ephemeral storage.
+        #   It is destroyed when the pod is deleted — no persistent state needed
+        #   since all valuable data is uploaded to GCS before the pod exits.
+        - name: workspace
+          emptyDir:
+            sizeLimit: "50Gi"   # Prevents disk exhaustion on the node
+
+        # Small memory-backed temp for system operations (pip, apt)
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: "1Gi"

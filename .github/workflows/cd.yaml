@@ -1,0 +1,609 @@
+# =============================================================================
+# .github/workflows/cd.yaml — Continuous Deployment
+#
+# TRIGGER:
+#   Push to `main` branch (i.e., after a PR is merged and CI passes).
+#   Also workflow_dispatch for manual deployments.
+#
+# PIPELINE (3 jobs, sequential):
+#
+#   Job 1 — build-and-push
+#     Authenticate to GCP via Workload Identity Federation (no JSON key)
+#     Build Docker image with BuildKit (multi-stage, layer cache)
+#     Tag with commit SHA: us-central1-docker.pkg.dev/PROJECT/REPO/IMAGE:SHA
+#     Push to Google Artifact Registry
+#
+#   Job 2 — scan-image
+#     Pull the just-built image from Artifact Registry
+#     Run Trivy container vulnerability scan
+#     FAIL if any HIGH or CRITICAL CVEs found (blocks deployment)
+#
+#   Job 3 — deploy
+#     GitHub Environment gate: "production" (optional: require manual approval)
+#     Get GKE credentials via gke-gcloud-auth-plugin (no ~/.kube/config in repo)
+#     kubectl set image → triggers rolling update (maxUnavailable:0, maxSurge:1)
+#     kubectl rollout status --timeout=300s → waits for completion
+#     Automated rollback on failure → kubectl rollout undo
+#     Post-deploy health verification
+#
+# WHY WORKLOAD IDENTITY FEDERATION (NOT JSON KEYS)?
+#   Traditional approach: Create a GCP Service Account → download JSON key →
+#   store as GitHub Secret → use in workflow.
+#   Problems:
+#     • JSON keys never expire (rotate manually or risk permanent breach)
+#     • If the secret leaks (log exposure, repo fork), attacker has persistent access
+#     • Managing key rotation across many repos and environments is complex
+#
+#   Workload Identity Federation (WIF):
+#     • GitHub Actions generates a short-lived OIDC token per job (~15 min TTL)
+#     • GCP validates the OIDC token and issues a short-lived GCP access token
+#     • No static credentials stored anywhere — nothing to rotate or leak
+#     • Conditional: only THIS repo + THIS branch can impersonate the GCP SA
+#
+# GCP SETUP (run once before using this workflow):
+#
+#   # 1. Enable required APIs
+#   gcloud services enable iam.googleapis.com iamcredentials.googleapis.com \
+#     artifactregistry.googleapis.com container.googleapis.com \
+#     --project=PROJECT_ID
+#
+#   # 2. Create WIF identity pool
+#   gcloud iam workload-identity-pools create "github-actions-pool" \
+#     --project=PROJECT_ID \
+#     --location="global" \
+#     --display-name="GitHub Actions Pool"
+#
+#   # 3. Create OIDC provider within the pool
+#   #    attribute-mapping: maps GitHub OIDC claims to GCP attributes
+#   #    attribute.repository: used to restrict which repo can use this pool
+#   gcloud iam workload-identity-pools providers create-oidc "github-provider" \
+#     --project=PROJECT_ID \
+#     --location="global" \
+#     --workload-identity-pool="github-actions-pool" \
+#     --display-name="GitHub OIDC Provider" \
+#     --attribute-mapping="\
+#       google.subject=assertion.sub,\
+#       attribute.repository=assertion.repository,\
+#       attribute.ref=assertion.ref" \
+#     --attribute-condition="attribute.repository=='YOUR_GITHUB_ORG/YOUR_REPO'" \
+#     --issuer-uri="https://token.actions.githubusercontent.com"
+#
+#   # 4. Create the CI/CD GCP Service Account
+#   gcloud iam service-accounts create github-cicd-sa \
+#     --project=PROJECT_ID \
+#     --display-name="GitHub Actions CI/CD"
+#
+#   # 5. Grant roles to the CI/CD SA:
+#   #    - Artifact Registry Writer: push Docker images
+#   #    - Container Developer: kubectl access (get credentials + set image)
+#   gcloud projects add-iam-policy-binding PROJECT_ID \
+#     --member="serviceAccount:github-cicd-sa@PROJECT_ID.iam.gserviceaccount.com" \
+#     --role="roles/artifactregistry.writer"
+#
+#   gcloud projects add-iam-policy-binding PROJECT_ID \
+#     --member="serviceAccount:github-cicd-sa@PROJECT_ID.iam.gserviceaccount.com" \
+#     --role="roles/container.developer"
+#
+#   # 6. Allow GitHub Actions to impersonate the CI/CD SA
+#   #    Replace PROJECT_NUMBER with `gcloud projects describe PROJECT_ID --format='value(projectNumber)'`
+#   #    Replace YOUR_GITHUB_ORG/YOUR_REPO with your actual GitHub repository
+#   gcloud iam service-accounts add-iam-policy-binding \
+#     github-cicd-sa@PROJECT_ID.iam.gserviceaccount.com \
+#     --project=PROJECT_ID \
+#     --role="roles/iam.workloadIdentityUser" \
+#     --member="principalSet://iam.googleapis.com/projects/PROJECT_NUMBER/\
+# locations/global/workloadIdentityPools/github-actions-pool/\
+# attribute.repository/YOUR_GITHUB_ORG/YOUR_REPO"
+#
+# GITHUB SECRETS (configure in Settings → Secrets and variables → Actions):
+#
+#   GCP_PROJECT_ID                 → Your GCP project ID (e.g., my-gke-project)
+#   GCP_WORKLOAD_IDENTITY_PROVIDER → Full WIF provider resource name:
+#                                    projects/PROJECT_NUMBER/locations/global/
+#                                    workloadIdentityPools/github-actions-pool/
+#                                    providers/github-provider
+#   GCP_SERVICE_ACCOUNT            → github-cicd-sa@PROJECT_ID.iam.gserviceaccount.com
+#   GKE_CLUSTER_NAME               → Your GKE cluster name (e.g., mistral-cluster)
+#   GKE_CLUSTER_REGION             → GKE cluster region (e.g., us-central1)
+#
+# =============================================================================
+
+name: CD — Build, Push, Deploy
+
+on:
+  push:
+    branches:
+      - main
+    # WHY paths filter?
+    #   Don't run the full CD pipeline for markdown or docs changes.
+    #   Only rebuild and redeploy when source code or Docker config changes.
+    #   k8s/fastapi/** changes also trigger CD — updating ConfigMaps or resource limits
+    #   should trigger a redeploy to apply the changes.
+    paths:
+      - 'app/**'
+      - 'Dockerfile'
+      - 'requirements.txt'
+      - 'k8s/fastapi/**'
+      - '.github/workflows/cd.yaml'
+
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for manual deployment'
+        required: true
+        default: 'Manual deployment'
+
+# ── Top-level environment variables ─────────────────────────────────────────
+# WHY define these at workflow level?
+#   Centralised — change REGION or REPOSITORY in one place, affects all jobs.
+#   Jobs inherit these via `env` context.
+env:
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION: us-central1
+  ARTIFACT_REGISTRY_HOST: us-central1-docker.pkg.dev
+  REPOSITORY: mistral-repo
+  IMAGE_NAME: mistral-inference-gateway
+  GKE_CLUSTER_NAME: ${{ secrets.GKE_CLUSTER_NAME }}
+  GKE_CLUSTER_REGION: ${{ secrets.GKE_CLUSTER_REGION }}
+  NAMESPACE: mistral-gateway
+  DEPLOYMENT_NAME: fastapi
+  CONTAINER_NAME: fastapi   # Container name in k8s/fastapi/04-deployment.yaml
+
+# ── Concurrency ──────────────────────────────────────────────────────────────
+# WHY prevent concurrent deployments?
+#   Two simultaneous CD runs targeting the same cluster could:
+#     • Deploy different image tags in an undefined order
+#     • Race on `kubectl rollout status` and produce misleading results
+#     • Both attempt rollback simultaneously on failure
+#   cancel-in-progress: false — new deployment WAITS for the current one to
+#   finish rather than cancelling it. This prevents partial rollouts.
+concurrency:
+  group: cd-production
+  cancel-in-progress: false
+
+jobs:
+
+  # ============================================================================
+  # JOB 1: Build and Push Docker Image to Artifact Registry
+  # ============================================================================
+  build-and-push:
+    name: Build & Push to Artifact Registry
+    runs-on: ubuntu-latest
+
+    # WHY these permissions?
+    #   contents: read         — check out source code
+    #   id-token: write        — REQUIRED for Workload Identity Federation
+    #                            (allows this job to request an OIDC token from GitHub)
+    permissions:
+      contents: read
+      id-token: write
+
+    # WHY outputs?
+    #   The `image` and `digest` outputs pass the exact image reference to
+    #   subsequent jobs. Using digest (SHA256) instead of just a tag ensures
+    #   the scan and deploy jobs use the EXACT same image that was built —
+    #   a tag could theoretically be overwritten between jobs (TOCTOU attack).
+    outputs:
+      image: ${{ steps.tag.outputs.image }}
+      image-digest: ${{ steps.push.outputs.digest }}
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      # ── Step 1: Authenticate to GCP via Workload Identity Federation ─────────
+      - name: Authenticate to Google Cloud (WIF — no JSON key)
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          # WHY workload_identity_provider?
+          #   This is the full resource name of the WIF provider created in setup.
+          #   GitHub Actions sends its OIDC token here → GCP validates it →
+          #   issues a short-lived GCP access token for this job only.
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          # WHY service_account?
+          #   The WIF token is exchanged for credentials of this GCP SA.
+          #   The SA has: roles/artifactregistry.writer, roles/container.developer.
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          # WHY token_format: access_token?
+          #   Needed for `gcloud auth configure-docker` below.
+          #   Without this, Docker authentication fails.
+          token_format: access_token
+
+      # ── Step 2: Configure Docker to authenticate with Artifact Registry ──────
+      - name: Configure Docker for Artifact Registry
+        # WHY gcloud auth configure-docker?
+        #   Artifact Registry requires Docker to authenticate using GCP credentials.
+        #   This command adds credential helpers to ~/.docker/config.json so Docker
+        #   automatically uses the WIF access token when pushing/pulling from
+        #   us-central1-docker.pkg.dev (and any other configured registry hosts).
+        run: |
+          gcloud auth configure-docker ${{ env.ARTIFACT_REGISTRY_HOST }} --quiet
+          echo "Docker configured for ${{ env.ARTIFACT_REGISTRY_HOST }}"
+
+      # ── Step 3: Set up Docker Buildx ─────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          # WHY driver: docker-container?
+          #   The docker-container driver creates an isolated BuildKit container.
+          #   It supports: multi-platform builds, advanced caching, BuildKit features.
+          #   The default `docker` driver doesn't support `--cache-to type=gha`.
+          driver-opts: |
+            network=host
+
+      # ── Step 4: Generate the image tag ────────────────────────────────────────
+      - name: Generate image tag (commit SHA)
+        id: tag
+        run: |
+          # WHY SHA-based tags?
+          #   Semantic version tags (v1.2.3) require a tagging ceremony.
+          #   SHA tags are:
+          #     • Automatic — no human decision needed
+          #     • Unique — each commit = distinct image
+          #     • Traceable — kubectl describe pod → image SHA → git log → commit diff
+          #     • Immutable — a SHA tag cannot be overwritten (unlike `latest`)
+          #
+          # SHORT_SHA: first 8 characters of the 40-char commit SHA
+          # Example: us-central1-docker.pkg.dev/my-proj/mistral-repo/mistral-inference-gateway:a1b2c3d4
+          SHORT_SHA="${GITHUB_SHA::8}"
+
+          IMAGE="${{ env.ARTIFACT_REGISTRY_HOST }}/${{ env.GCP_PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE_NAME }}:${SHORT_SHA}"
+
+          echo "image=${IMAGE}" >> $GITHUB_OUTPUT
+          echo "short-sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+
+          echo "Image tag: ${IMAGE}"
+
+      # ── Step 5: Build and push ─────────────────────────────────────────────────
+      - name: Build and push Docker image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # WHY push: true (not load)?
+          #   `load` stores the image in the local Docker daemon — not Artifact Registry.
+          #   `push: true` builds and pushes directly to the registry.
+          push: true
+          tags: |
+            ${{ steps.tag.outputs.image }}
+          # WHY no `latest` tag?
+          #   `latest` is mutable — it can point to different images over time.
+          #   In production, pods reference specific SHA tags.
+          #   If you push both SHA and latest, a pod restart could pick up `latest`
+          #   (a different version) if the node doesn't have the SHA tag cached.
+          #   Keep SHA tags only for production determinism.
+
+          # WHY GHA cache?
+          #   Docker layer cache dramatically speeds up repeat builds.
+          #   Our Dockerfile layers (from Phase 2):
+          #     Layer 1: python:3.12-slim base          — NEVER changes → cache forever
+          #     Layer 2: system packages (apt-get)       — changes rarely → long cache
+          #     Layer 3: pip install -r requirements.txt — changes on dep update
+          #     Layer 4: COPY app/ code                  — changes on every PR
+          #   Only Layer 4 is rebuilt most of the time → fast CI builds.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+          # WHY provenance: true + sbom: true?
+          #   provenance: Generates SLSA provenance attestation — cryptographically
+          #               proves this image was built from this specific commit
+          #               in this specific workflow. Required for SLSA Level 2 compliance.
+          #   sbom:       Software Bill of Materials — lists every package in the image.
+          #               Required by some compliance frameworks (SOC2, HIPAA).
+          #               Both are stored in Artifact Registry alongside the image.
+          provenance: true
+          sbom: true
+
+      - name: Print image digest (SHA256)
+        run: |
+          echo "Image:  ${{ steps.tag.outputs.image }}"
+          echo "Digest: ${{ steps.push.outputs.digest }}"
+
+  # ============================================================================
+  # JOB 2: Scan the Container Image for Vulnerabilities
+  # Runs AFTER build-and-push, BEFORE deploy.
+  # A HIGH or CRITICAL CVE blocks deployment.
+  # ============================================================================
+  scan-image:
+    name: Scan Container Image (Trivy)
+    runs-on: ubuntu-latest
+    needs: build-and-push   # Must have the image before scanning it
+
+    permissions:
+      contents: read
+      id-token: write
+      security-events: write   # Upload SARIF results
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.ARTIFACT_REGISTRY_HOST }} --quiet
+
+      - name: Scan image for CVEs
+        # WHY scan the container IMAGE (not just the filesystem)?
+        #   The CI job's filesystem scan (ci.yaml) checked Python packages.
+        #   The container image also includes:
+        #     • OS packages (Debian/Ubuntu in python:3.12-slim base image)
+        #     • System libraries (libssl, libgcc, glibc)
+        #   These can have CVEs not visible in requirements.txt.
+        #   A container image scan gives the most complete vulnerability picture.
+        #
+        # WHY exit-code: 1 (unlike filesystem scan in ci.yaml)?
+        #   Container image CVEs are actionable — we can update the base image tag.
+        #   If a critical CVE is found: update Dockerfile FROM to python:3.12.X-slim
+        #   (a newer patch version) and re-run the pipeline.
+        #   Blocking deployment on HIGH/CRITICAL prevents deploying known-vulnerable images.
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          # WHY use image-ref (pull from registry) not scan-type: fs?
+          #   We scan the EXACT image that will be deployed — including all layers.
+          #   The registry stores the image built in Job 1. Pulling it here
+          #   validates that the push succeeded AND that the full image is scannable.
+          image-ref: ${{ needs.build-and-push.outputs.image }}
+          format: sarif
+          output: trivy-image-results.sarif
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          # WHY ignore-unfixed: true?
+          #   Some CVEs have no available fix (the upstream project hasn't patched it).
+          #   Blocking deployment on unfixable CVEs creates a permanent blocker
+          #   with no actionable resolution. We report them but don't block deployment.
+          ignore-unfixed: true
+
+      - name: Upload image scan results to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image-results.sarif
+          category: trivy-container-image
+
+  # ============================================================================
+  # JOB 3: Deploy to GKE — Rolling Update
+  # Runs AFTER scan-image passes (image is safe to deploy).
+  # Uses `environment: production` for deployment gate.
+  # ============================================================================
+  deploy:
+    name: Deploy to GKE (Rolling Update)
+    runs-on: ubuntu-latest
+    # WHY needs both build-and-push AND scan-image?
+    #   If scan-image is skipped or fails, deploy must NOT run.
+    #   `needs: [build-and-push, scan-image]` means:
+    #     • If build-and-push fails → scan-image skipped → deploy blocked
+    #     • If scan-image finds HIGH CVE → deploy blocked
+    #     • Only if BOTH jobs succeed → deploy runs
+    needs: [build-and-push, scan-image]
+
+    permissions:
+      contents: read
+      id-token: write
+
+    # WHY environment: production?
+    #   GitHub Environments let you configure deployment protection rules:
+    #     • Required reviewers: specific people must approve before deploy runs
+    #     • Wait timer: impose a delay after PR merge (e.g., 5 minutes for panic abort)
+    #     • Deployment history: track what was deployed when and by whom
+    #
+    #   Configure in: Settings → Environments → production → Protection rules
+    #   For fully automated CD (no manual approval): leave protection rules empty.
+    #   For controlled CD (1 approval required): add a required reviewer.
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Step 1: Authenticate to GCP ──────────────────────────────────────────
+      - name: Authenticate to Google Cloud (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      # ── Step 2: Get GKE credentials ───────────────────────────────────────────
+      - name: Get GKE cluster credentials
+        # WHY google-github-actions/get-gke-credentials?
+        #   This action runs `gcloud container clusters get-credentials` and
+        #   configures kubectl to authenticate to your GKE cluster using the
+        #   WIF access token. It writes a kubeconfig that expires with the token.
+        #   No kubeconfig files are committed to the repo — credentials are ephemeral.
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.GKE_CLUSTER_NAME }}
+          location: ${{ env.GKE_CLUSTER_REGION }}
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
+      # ── Step 3: Pre-deployment verification ──────────────────────────────────
+      - name: Verify cluster connection and current state
+        run: |
+          echo "=== Cluster connection ==="
+          kubectl cluster-info --context=$(kubectl config current-context)
+
+          echo ""
+          echo "=== Current Deployment state ==="
+          kubectl get deployment ${{ env.DEPLOYMENT_NAME }} \
+            -n ${{ env.NAMESPACE }} \
+            -o wide
+
+          echo ""
+          echo "=== Current Pods ==="
+          kubectl get pods \
+            -n ${{ env.NAMESPACE }} \
+            -l app=${{ env.DEPLOYMENT_NAME }} \
+            -o wide
+
+          echo ""
+          echo "=== Deployment rollout history ==="
+          kubectl rollout history deployment/${{ env.DEPLOYMENT_NAME }} \
+            -n ${{ env.NAMESPACE }}
+
+      # ── Step 4: Rolling Update via kubectl set image ──────────────────────────
+      - name: Rolling update — set new image
+        id: rolling-update
+        run: |
+          IMAGE="${{ needs.build-and-push.outputs.image }}"
+          SHORT_SHA="${GITHUB_SHA::8}"
+
+          echo "Deploying image: ${IMAGE}"
+          echo "From commit:     ${GITHUB_SHA}"
+          echo "Triggered by:    ${{ github.actor }}"
+
+          # WHY `kubectl set image` and not `kubectl apply -f`?
+          #   kubectl set image DEPLOYMENT/NAME CONTAINER=IMAGE:TAG
+          #   It updates ONLY the image field of the Deployment — surgical, fast.
+          #
+          #   kubectl apply -f would re-apply the entire manifest.
+          #   If the manifest still has the old image tag (0.1.0), it would
+          #   UNDO the new deployment. We avoid this by using set image.
+          #
+          #   Production-grade alternative: Kustomize image patches or Helm --set
+          #   which keep the manifests as the source of truth.
+          #   For now, kubectl set image is correct, simple, and interview-ready.
+          kubectl set image \
+            deployment/${{ env.DEPLOYMENT_NAME }} \
+            ${{ env.CONTAINER_NAME }}="${IMAGE}" \
+            --namespace=${{ env.NAMESPACE }}
+
+          # WHY annotate with change-cause?
+          #   `kubectl rollout history` shows the change-cause annotation, making
+          #   it easy to see what each revision deployed and why:
+          #     REVISION  CHANGE-CAUSE
+          #     1         Initial deployment
+          #     2         CI/CD: SHA=a1b2c3d4 actor=deepak workflow=CD
+          #   This is the Kubernetes audit trail for deployments.
+          kubectl annotate deployment/${{ env.DEPLOYMENT_NAME }} \
+            kubernetes.io/change-cause="CI/CD: SHA=${SHORT_SHA} actor=${{ github.actor }} run=${{ github.run_number }}" \
+            --namespace=${{ env.NAMESPACE }} \
+            --overwrite
+
+          echo "Rolling update initiated."
+
+      # ── Step 5: Wait for rolling update to complete ───────────────────────────
+      - name: Wait for rollout completion
+        id: rollout-status
+        run: |
+          echo "Waiting for rolling update to complete..."
+          echo "Strategy: maxUnavailable=0, maxSurge=1 (from k8s/fastapi/04-deployment.yaml)"
+          echo ""
+          echo "What Kubernetes is doing:"
+          echo "  1. Create 1 new pod with image: ${{ needs.build-and-push.outputs.image }}"
+          echo "  2. Wait for new pod to pass readiness probe (/ready on :8000)"
+          echo "  3. Terminate 1 old pod (maxUnavailable=0 → no traffic disruption)"
+          echo "  4. Repeat until all 2 replicas are updated"
+          echo ""
+
+          # WHY --timeout=300s (5 minutes)?
+          #   FastAPI starts in ~5 seconds (no model loading).
+          #   300 seconds gives ample time even if the node needs to pull the image
+          #   (first deployment to a new node: ~60 seconds for image pull).
+          #   If rollout doesn't complete in 5 minutes, something is wrong:
+          #     • Image pull failure (wrong tag, Artifact Registry auth error)
+          #     • Readiness probe failing (app startup bug in new code)
+          #     • Resource limits exceeded (OOMKill on startup)
+          #   kubectl rollout status exits non-zero on timeout → triggers rollback.
+          kubectl rollout status \
+            deployment/${{ env.DEPLOYMENT_NAME }} \
+            --namespace=${{ env.NAMESPACE }} \
+            --timeout=300s
+
+          echo ""
+          echo "✅ Rolling update completed successfully."
+
+      # ── Step 6: Auto-rollback on failure ──────────────────────────────────────
+      - name: Rollback on failure
+        # WHY if: failure() (not if: always())?
+        #   failure() runs ONLY if a previous step failed.
+        #   always() runs even on success — would incorrectly roll back good deploys.
+        if: failure() && steps.rolling-update.outcome == 'success'
+        run: |
+          echo "⚠️  Deployment failed. Initiating automatic rollback..."
+          echo ""
+          echo "Current failed state:"
+          kubectl get pods -n ${{ env.NAMESPACE }} -l app=${{ env.DEPLOYMENT_NAME }}
+          echo ""
+
+          # WHY kubectl rollout undo?
+          #   rollout undo reverts the Deployment to the PREVIOUS revision.
+          #   Kubernetes has already stored the previous pod template (old image tag)
+          #   in the Deployment's rollout history. undo simply swaps back to it
+          #   using the same rolling update strategy (maxUnavailable=0, maxSurge=1).
+          #   Zero downtime rollback — old pods come back before new ones are removed.
+          kubectl rollout undo \
+            deployment/${{ env.DEPLOYMENT_NAME }} \
+            --namespace=${{ env.NAMESPACE }}
+
+          echo "Waiting for rollback to complete..."
+          kubectl rollout status \
+            deployment/${{ env.DEPLOYMENT_NAME }} \
+            --namespace=${{ env.NAMESPACE }} \
+            --timeout=300s
+
+          echo ""
+          echo "✅ Rollback completed. Previous version is serving traffic."
+          echo "Investigate the failed deployment with:"
+          echo "  kubectl describe deployment ${{ env.DEPLOYMENT_NAME }} -n ${{ env.NAMESPACE }}"
+          echo "  kubectl logs -l app=${{ env.DEPLOYMENT_NAME }} -n ${{ env.NAMESPACE }} --previous"
+
+          # Exit non-zero to mark the workflow run as FAILED even after successful rollback.
+          # WHY? A failed deploy that successfully rolled back should still be visible
+          # as a failure in the GitHub Actions UI — it should NOT show as green.
+          exit 1
+
+      # ── Step 7: Post-deployment verification ──────────────────────────────────
+      - name: Verify deployment health
+        run: |
+          IMAGE="${{ needs.build-and-push.outputs.image }}"
+
+          echo "=== Final Pod state ==="
+          kubectl get pods \
+            -n ${{ env.NAMESPACE }} \
+            -l app=${{ env.DEPLOYMENT_NAME }} \
+            -o wide
+
+          echo ""
+          echo "=== Verify running image matches deployed image ==="
+          RUNNING_IMAGE=$(kubectl get deployment ${{ env.DEPLOYMENT_NAME }} \
+            -n ${{ env.NAMESPACE }} \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')
+
+          echo "Expected: ${IMAGE}"
+          echo "Running:  ${RUNNING_IMAGE}"
+
+          if [ "${RUNNING_IMAGE}" = "${IMAGE}" ]; then
+            echo "✅ Image match confirmed."
+          else
+            echo "❌ Image mismatch! Deployment may have been overridden."
+            exit 1
+          fi
+
+          echo ""
+          echo "=== Deployment conditions ==="
+          kubectl get deployment ${{ env.DEPLOYMENT_NAME }} \
+            -n ${{ env.NAMESPACE }} \
+            -o jsonpath='{range .status.conditions[*]}{.type}{": "}{.status}{" — "}{.message}{"\n"}{end}'
+
+          echo ""
+          echo "=== Updated rollout history ==="
+          kubectl rollout history deployment/${{ env.DEPLOYMENT_NAME }} \
+            -n ${{ env.NAMESPACE }}
+
+      # ── Step 8: Deployment summary ─────────────────────────────────────────────
+      - name: Print deployment summary
+        if: success()
+        run: |
+          echo "╔══════════════════════════════════════════════════════════╗"
+          echo "║          ✅  DEPLOYMENT SUCCESSFUL                       ║"
+          echo "╠══════════════════════════════════════════════════════════╣"
+          echo "║  Image:     ${{ needs.build-and-push.outputs.image }}"
+          echo "║  Digest:    ${{ needs.build-and-push.outputs.image-digest }}"
+          echo "║  Commit:    ${{ github.sha }}"
+          echo "║  Actor:     ${{ github.actor }}"
+          echo "║  Run:       ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "╚══════════════════════════════════════════════════════════╝"

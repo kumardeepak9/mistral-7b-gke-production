@@ -1,0 +1,189 @@
+# =============================================================================
+# k8s/networking/02-backend-config.yaml
+#
+# WHAT IS BackendConfig?
+#   A GKE-specific CRD that configures the BACKEND of the GCP HTTPS Load Balancer
+#   (the part that forwards requests to pods). It controls:
+#     • Cloud Armor WAF security policy (which rules evaluate each request)
+#     • Backend timeout (how long the LB waits for a pod to respond)
+#     • Connection draining (how long to wait before killing in-flight requests)
+#     • Health check (how the LB confirms pods are alive)
+#     • Access logging (Cloud Logging integration for LB access logs)
+#
+# HOW IT CONNECTS TO THE SERVICE:
+#   The FastAPI Service has this annotation (activated in Phase 6):
+#     cloud.google.com/backend-config: '{"ports": {"80": "fastapi-backend-config"}}'
+#   This tells GKE: "apply this BackendConfig to the LB backend for port 80."
+#   The Ingress uses the Service as its backend → BackendConfig is applied.
+#
+# CLOUD ARMOR PREREQUISITE:
+#   The securityPolicy name referenced here ("mistral-cloud-armor-policy") must be
+#   created in GCP BEFORE applying this BackendConfig. If the policy doesn't exist,
+#   GKE will reject this resource.
+#
+#   Create the Cloud Armor policy (gcloud commands — run before applying this file):
+#
+#   # 1. Create the security policy
+#   gcloud compute security-policies create mistral-cloud-armor-policy \
+#     --description="WAF policy for Mistral inference API" \
+#     --global
+#
+#   # 2. Enable Adaptive Protection (ML-based DDoS detection)
+#   gcloud compute security-policies update mistral-cloud-armor-policy \
+#     --enable-layer7-ddos-defense \
+#     --global
+#
+#   # 3. Pre-configured WAF rules — OWASP ModSecurity CRS rules
+#   #    These block SQLi, XSS, LFI, RFI, RCE, Scanner Detection, etc.
+#   gcloud compute security-policies rules create 1000 \
+#     --security-policy=mistral-cloud-armor-policy \
+#     --expression="evaluatePreconfiguredExpr('xss-v33-stable')" \
+#     --action=deny-403 \
+#     --description="Block XSS (Cross-Site Scripting)"
+#
+#   gcloud compute security-policies rules create 1001 \
+#     --security-policy=mistral-cloud-armor-policy \
+#     --expression="evaluatePreconfiguredExpr('sqli-v33-stable')" \
+#     --action=deny-403 \
+#     --description="Block SQL injection"
+#
+#   gcloud compute security-policies rules create 1002 \
+#     --security-policy=mistral-cloud-armor-policy \
+#     --expression="evaluatePreconfiguredExpr('rce-v33-stable')" \
+#     --action=deny-403 \
+#     --description="Block Remote Code Execution"
+#
+#   gcloud compute security-policies rules create 1003 \
+#     --security-policy=mistral-cloud-armor-policy \
+#     --expression="evaluatePreconfiguredExpr('lfi-v33-stable')" \
+#     --action=deny-403 \
+#     --description="Block Local File Inclusion"
+#
+#   # 4. Rate limiting — 60 requests/minute per source IP
+#   #    Prevents API abuse and GPU resource exhaustion
+#   gcloud compute security-policies rules create 2000 \
+#     --security-policy=mistral-cloud-armor-policy \
+#     --expression="true" \
+#     --action=rate-based-ban \
+#     --rate-limit-threshold-count=60 \
+#     --rate-limit-threshold-interval-sec=60 \
+#     --ban-duration-sec=300 \
+#     --exceed-action=deny-429 \
+#     --description="Rate limit: 60 req/min per IP, ban 5 min if exceeded"
+#
+#   # 5. IP reputation-based blocking (Tor, anonymous proxies, botnets)
+#   gcloud compute security-policies rules create 3000 \
+#     --security-policy=mistral-cloud-armor-policy \
+#     --expression="evaluateThreatIntelligence('iplist-tor-exit-nodes')" \
+#     --action=deny-403 \
+#     --description="Block Tor exit nodes"
+#
+#   gcloud compute security-policies rules create 3001 \
+#     --security-policy=mistral-cloud-armor-policy \
+#     --expression="evaluateThreatIntelligence('iplist-known-malicious-ips')" \
+#     --action=deny-403 \
+#     --description="Block known malicious IPs (Cloud Armor Threat Intelligence)"
+#
+#   # 6. Default allow rule (lower priority = fallback)
+#   #    The default rule (priority 2147483647) is already "allow" in Cloud Armor.
+#   #    Our rules above run at higher priority (lower number = higher priority).
+#
+# COMMAND: kubectl apply -f k8s/networking/02-backend-config.yaml
+# =============================================================================
+
+apiVersion: cloud.google.com/v1    # GKE-specific API group for cloud backend configs
+kind: BackendConfig
+metadata:
+  name: fastapi-backend-config      # Referenced in fastapi Service annotation
+  namespace: mistral-gateway
+
+  labels:
+    app.kubernetes.io/name: mistral-inference-gateway
+    app.kubernetes.io/component: backend-config
+    app.kubernetes.io/part-of: mistral-gateway
+
+spec:
+  # ── Cloud Armor WAF policy ────────────────────────────────────────────────────
+  # WHY securityPolicy here instead of at the Ingress level?
+  #   Cloud Armor policies are applied per BACKEND SERVICE (not per frontend).
+  #   Each Ingress backend (Service) gets its own policy attachment.
+  #   This allows different WAF policies for different services
+  #   (e.g., stricter for /v1/chat/completions, permissive for /health).
+  #
+  # The policy name must exactly match the Cloud Armor policy created via gcloud.
+  # See gcloud commands in the header comment above.
+  securityPolicy:
+    name: mistral-cloud-armor-policy
+
+  # ── Backend timeout ───────────────────────────────────────────────────────────
+  # WHY 135 seconds?
+  #   The LB timeout must be GREATER than the FastAPI pod's timeout for vLLM.
+  #   From k8s/fastapi/01-configmap.yaml: VLLM_TIMEOUT_SECONDS = 120
+  #   FastAPI waits up to 120s for vLLM, then returns 504.
+  #
+  #   If the LB timeout (timeoutSec) < 120s:
+  #     LB closes the connection at timeoutSec → client gets 503 (LB timeout)
+  #     FastAPI never gets a chance to return its own 504 with a useful error body.
+  #
+  #   135s = 120s (vLLM timeout) + 15s (FastAPI processing + response serialisation)
+  #   If the LB sees no response in 135s, it returns 504 Gateway Timeout.
+  timeoutSec: 135
+
+  # ── Connection draining ───────────────────────────────────────────────────────
+  # WHY connectionDraining?
+  #   During a rolling update or pod removal, the LB needs to stop sending NEW
+  #   requests to the pod being removed while allowing IN-FLIGHT requests to complete.
+  #   drainingTimeoutSec: 30 means:
+  #     → Pod marked for removal by Kubernetes (readiness probe fails OR pod terminating)
+  #     → LB stops sending NEW requests to that pod IP
+  #     → LB waits up to 30 seconds for existing connections to finish
+  #     → After 30s, LB forcibly closes any remaining connections
+  #   This prevents 502 errors during deployments.
+  connectionDraining:
+    drainingTimeoutSec: 30
+
+  # ── Load Balancer health check ────────────────────────────────────────────────
+  # WHY a separate LB health check (not relying on K8s readiness probe alone)?
+  #   Two health check layers exist:
+  #     1. Kubernetes readiness probe: determines if the pod IP is in Endpoints
+  #     2. GCP Load Balancer health check (this): determines if the NEG backend
+  #        is healthy from the LB's perspective (network path + HTTP response)
+  #
+  #   The GCP health check runs from Google's health checking infrastructure,
+  #   not from within the cluster. It validates the full network path from the
+  #   GCP LB → VPC → node → pod.
+  #
+  # WHY /health on port 8000?
+  #   The LB health check bypasses the Service's port 80 and goes directly to
+  #   the pod's containerPort 8000 (using NEG — pod-direct routing).
+  #   /health is our lightweight health endpoint (app/routers/health.py).
+  healthCheck:
+    checkIntervalSec: 15       # How often the LB checks each backend pod
+    timeoutSec: 10             # How long to wait for /health to respond
+    healthyThreshold: 1        # 1 success → pod is "healthy" to the LB
+    unhealthyThreshold: 3      # 3 consecutive failures → pod removed from LB
+    type: HTTP
+    requestPath: /health       # Must match app/routers/health.py router path
+    port: 8000                 # Direct pod port, not Service port 80
+
+  # ── Access logging ────────────────────────────────────────────────────────────
+  # WHY LB-level logging in addition to FastAPI structured logging?
+  #   LB logs capture:
+  #     • Requests REJECTED by Cloud Armor before reaching FastAPI (SQLi attempts)
+  #     • Requests that TIME OUT at the LB before FastAPI responds
+  #     • Client IP, country, latency from LB perspective
+  #   FastAPI logs only see requests that REACH the pod.
+  #   Together they give a complete picture: LB logs for perimeter view,
+  #   FastAPI logs for application view.
+  #
+  # WHY sampleRate: 0.1 (10%) not 1.0 (100%)?
+  #   At production scale (100+ req/min), logging every request generates
+  #   significant Cloud Logging costs (charged per GB ingested).
+  #   10% sampling captures enough for trend analysis and anomaly detection.
+  #   Cloud Armor ALWAYS logs blocked requests (security events) regardless
+  #   of the sampleRate — security visibility is never sampled away.
+  #
+  #   Use 1.0 during initial deployment for full visibility, then reduce to 0.1.
+  logging:
+    enable: true
+    sampleRate: 0.1

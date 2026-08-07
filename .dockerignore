@@ -1,0 +1,50 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# .dockerignore
+#
+# WHY: Keeps the Docker build context lean and secure.
+#      Without this, Docker would send __pycache__, .env (secrets!), .git
+#      history, and local venvs to the daemon — slowing builds and risking
+#      secret leakage into the image layer.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Python artefacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local secrets — NEVER bake into image
+.env
+
+# Test and tooling artefacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Version control
+.git/
+.gitignore
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS artefacts
+.DS_Store
+Thumbs.db

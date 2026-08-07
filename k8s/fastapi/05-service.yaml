@@ -1,0 +1,99 @@
+# =============================================================================
+# k8s/fastapi/05-service.yaml
+#
+# WHY a Service?
+#   Pods are ephemeral — they restart, reschedule, and get new IP addresses.
+#   A Service provides a stable virtual IP (ClusterIP) and DNS name that other
+#   components use to reach the pods. Kubernetes keeps the Endpoints list
+#   (the set of pod IPs) up to date automatically via the selector.
+#
+# WHY ClusterIP and not LoadBalancer or NodePort?
+#   From Diagram 1, traffic flows:
+#     Internet → HTTPS Load Balancer → Cloud Armor → API Gateway
+#     → GKE Ingress Controller → FastAPI Service (ClusterIP) → FastAPI Pods
+#
+#   ClusterIP is internal-only — it has no external IP. The GKE Ingress
+#   Controller is the only component that talks to this Service. This is
+#   the correct architecture because:
+#     • The Ingress provides TLS termination, routing rules, and WAF integration.
+#     • Exposing FastAPI directly via LoadBalancer would bypass all of that.
+#     • ClusterIP is the most restrictive (and cheapest — no cloud LB fees).
+#
+# DNS name inside the cluster:
+#   fastapi-service.mistral-gateway.svc.cluster.local:80
+#   The GKE Ingress backend references this Service by name and port.
+#
+# COMMAND: kubectl apply -f k8s/fastapi/05-service.yaml
+# VERIFY:  kubectl get endpoints fastapi-service -n mistral-gateway
+# =============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: fastapi-service          # DNS name inside cluster: fastapi-service.mistral-gateway.svc.cluster.local
+  namespace: mistral-gateway
+
+  labels:
+    app.kubernetes.io/name: mistral-inference-gateway
+    app.kubernetes.io/component: service
+    app.kubernetes.io/part-of: mistral-gateway
+
+  annotations:
+    # WHY this annotation?
+    #   GKE's container-native load balancing (NEG — Network Endpoint Groups)
+    #   routes traffic directly to pod IPs, bypassing kube-proxy and iptables.
+    #   This reduces latency and enables more accurate health checking.
+    #   The Ingress (Phase 4) reads this annotation to create a NEG.
+    cloud.google.com/neg: '{"ingress": true}'
+
+    # WHY BackendConfig annotation?
+    #   BackendConfig is a GKE-specific CRD that configures the GCP Cloud Load
+    #   Balancer backend: timeout, Cloud Armor WAF policy, health check, logging.
+    #   This annotation tells GKE: "apply fastapi-backend-config to port 80 of this Service."
+    #   Without this annotation, BackendConfig exists but is NEVER applied —
+    #   Cloud Armor would not protect this service even if the policy is defined.
+    #   Created in Phase 6 (k8s/networking/02-backend-config.yaml).
+    cloud.google.com/backend-config: '{"ports": {"80": "fastapi-backend-config"}}'
+
+spec:
+  # WHY type: ClusterIP?
+  #   Internal-only virtual IP. Only reachable from within the cluster.
+  #   The GKE Ingress Controller routes to this Service from outside.
+  #   See diagram: Ingress Controller → FastAPI Service (ClusterIP) → Pods.
+  type: ClusterIP
+
+  # ── Selector ─────────────────────────────────────────────────────────────────
+  # WHY selector matches Deployment.spec.template.metadata.labels?
+  #   Kubernetes watches pods with these labels and maintains the Endpoints
+  #   object (list of pod IPs). When a pod passes readiness probe → added.
+  #   When a pod fails readiness probe → removed. Zero manual configuration.
+  selector:
+    app: fastapi           # Must match Deployment.spec.template.metadata.labels.app
+
+  # ── Ports ────────────────────────────────────────────────────────────────────
+  ports:
+    - name: http           # Named port — referenced by GKE Ingress backend servicePort
+
+      # WHY port: 80?
+      #   Port 80 is the Service's virtual port — what other components connect to.
+      #   The GKE Ingress will use port 80 as the backend service port.
+      #   TLS is terminated at the Ingress (HTTPS → HTTP internally). This is
+      #   standard: the cluster's internal traffic is plain HTTP, encrypted at
+      #   the network level by GKE's VPC and mTLS (if using Anthos Service Mesh).
+      port: 80
+
+      # WHY targetPort: http (not 8000)?
+      #   targetPort references the named port `http` defined in the Deployment's
+      #   containerPort. Using named ports instead of numbers means if the port
+      #   changes in the Deployment, the Service automatically follows — no update needed.
+      targetPort: http
+
+      protocol: TCP
+
+  # ── Session affinity ─────────────────────────────────────────────────────────
+  # WHY None (default)?
+  #   FastAPI is stateless — every request is independent. There is no benefit
+  #   to routing a client's requests to the same pod. None = round-robin load
+  #   balancing across all healthy pods. This maximises utilisation.
+  #   (If we had sticky sessions, we'd use sessionAffinity: ClientIP)
+  sessionAffinity: None
