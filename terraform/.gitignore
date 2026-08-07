@@ -1,0 +1,54 @@
+# =============================================================================
+# terraform/.gitignore
+#
+# WHY GITIGNORE FOR TERRAFORM?
+#   Several Terraform files must NEVER be committed to git:
+#
+#   .terraform/            — Downloaded provider binaries (~300 MB of Go binaries)
+#                            Re-downloaded by `terraform init` from the lock file
+#   terraform.tfstate      — Contains ALL resource IDs, IP addresses, SA keys,
+#                            and sometimes plaintext secrets (e.g. DB passwords)
+#                            Using remote state (GCS) means this should never
+#                            exist locally. If it does, it's a security risk.
+#   terraform.tfvars       — May contain your actual project_id, region, or any
+#                            variable overrides. Commit tfvars.example instead.
+#   *.tfplan               — Plan files contain the same sensitive info as tfstate
+#   crash.log              — Terraform crash reports may contain state fragments
+# =============================================================================
+
+# ── Terraform Core ────────────────────────────────────────────────────────────
+.terraform/
+.terraform.lock.hcl     # Commit this if you want reproducible provider versions
+                        # Uncomment the line below to gitignore it instead
+# .terraform.lock.hcl
+
+# ── State Files (use remote GCS backend instead) ──────────────────────────────
+terraform.tfstate
+terraform.tfstate.backup
+*.tfstate
+*.tfstate.*
+
+# ── Variable Files (may contain project IDs, secrets) ────────────────────────
+terraform.tfvars
+terraform.tfvars.json
+*.auto.tfvars
+*.auto.tfvars.json
+
+# ── Plan Files ────────────────────────────────────────────────────────────────
+*.tfplan
+*.plan
+
+# ── Crash Logs ────────────────────────────────────────────────────────────────
+crash.log
+crash.*.log
+
+# ── Override Files (local developer overrides) ────────────────────────────────
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# ── IDE / OS ──────────────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+*.swp
