@@ -26,12 +26,13 @@ import httpx
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
 from app.config import settings
+from app.core import add_exception_handlers
 from app.logging_config import setup_logging
 from app.middleware.logging import RequestLoggingMiddleware
 from app.routers import health, inference
+from app.schemas import ErrorResponse, RootResponse
 
 # Initialise structured logging FIRST — before any other imports emit logs.
 setup_logging()
@@ -61,13 +62,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         extra={
             "environment": settings.app_env,
             "version": settings.app_version,
-            "vllm_backend": settings.vllm_base_url,
+            "vllm_backend": str(settings.vllm_base_url),
         },
     )
 
     # Create the shared async HTTP client
     http_client = httpx.AsyncClient(
-        base_url=settings.vllm_base_url,
+        base_url=str(settings.vllm_base_url),
         timeout=httpx.Timeout(
             connect=5.0,
             read=float(settings.vllm_timeout_seconds),
@@ -85,7 +86,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Store on app.state so routers can access it via request.app.state.http_client
     app.state.http_client = http_client
 
-    logger.info("HTTP client pool initialised", extra={"vllm_base_url": settings.vllm_base_url})
+    logger.info("HTTP client pool initialised", extra={"vllm_base_url": str(settings.vllm_base_url)})
 
     yield  # ← application runs here
 
@@ -117,6 +118,7 @@ def create_application() -> FastAPI:
         openapi_url="/openapi.json",
         lifespan=lifespan,
     )
+    add_exception_handlers(application)
 
     # ── Middleware (order: last registered = outermost wrapper) ───────────
     # CORS — restrict in production via environment variable (Phase 3)
@@ -141,8 +143,10 @@ def create_application() -> FastAPI:
         summary="Root",
         description="Service identity endpoint. Returns name, version, and environment.",
         tags=["general"],
+        response_model=RootResponse,
+        responses={500: {"model": ErrorResponse}},
     )
-    async def root() -> JSONResponse:
+    async def root() -> RootResponse:
         """
         Root endpoint — confirms the service is reachable and identifies itself.
 
@@ -151,14 +155,12 @@ def create_application() -> FastAPI:
           • Service discovery by downstream consumers
           • Interview demo: curl https://<your-domain>/ → instant confirmation
         """
-        return JSONResponse(
-            content={
-                "service": "mistral-inference-gateway",
-                "version": settings.app_version,
-                "environment": settings.app_env,
-                "status": "running",
-                "docs": "/docs",
-            }
+        return RootResponse(
+            service="mistral-inference-gateway",
+            version=settings.app_version,
+            environment=settings.app_env,
+            status="running",
+            docs="/docs",
         )
 
     logger.info(
