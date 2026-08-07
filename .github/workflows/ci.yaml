@@ -52,9 +52,8 @@ on:
 #   what this workflow needs. This is the principle of least privilege
 #   applied to CI — a compromised CI job can't push code or modify issues.
 permissions:
-  contents: read          # Check out source code
-  pull-requests: write    # Post lint/test result comments on PR (future enhancement)
-  security-events: write  # Upload Trivy SARIF results to GitHub Security tab
+  contents: read
+  security-events: write
 
 # WHY concurrency group?
 #   If two commits are pushed to the same PR quickly, the first CI run becomes
@@ -91,6 +90,7 @@ jobs:
           #   The cache is keyed on requirements.txt hash — invalidated when deps change.
           #   Saves ~30 seconds per run by not re-downloading ruff/black.
           cache: pip
+          cache-dependency-path: requirements.txt
 
       - name: Install linting tools
         # WHY install separately from requirements.txt?
@@ -131,6 +131,7 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: requirements.txt
 
       - name: Install dependencies
         # WHY install from requirements.txt (not just test deps)?
@@ -202,6 +203,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          target: runtime
+          pull: true
           # WHY push: false?
           #   This is a CHECK — we only verify the Dockerfile builds without errors.
           #   Pushing from PR builds is dangerous: the PR might not be reviewed yet.
@@ -212,8 +215,8 @@ jobs:
           #   GitHub Actions cache stores Docker layer cache between workflow runs.
           #   On the second PR push: unchanged layers are loaded from cache, not rebuilt.
           #   A typical 7-layer FastAPI Dockerfile: first build ~3 min, cached ~45 sec.
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=ci-docker-build
+          cache-to: type=gha,mode=max,scope=ci-docker-build
 
   # ============================================================================
   # JOB 4: Security Scan (Filesystem)
