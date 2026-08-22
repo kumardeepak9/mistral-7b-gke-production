@@ -1,48 +1,4 @@
-# =============================================================================
-# k8s/vllm/01-deployment.yaml
-#
-# WHY Deployment (not StatefulSet) for vLLM?
-#   vLLM is stateless at the process level — all model state lives on the
-#   GPU (VRAM) and is re-loaded from the PVC on startup. There is no need
-#   for stable network IDs or per-pod PVC claims (StatefulSet features).
-#   Deployment gives us rolling updates, replica management, and HPA support.
-#
-# GPU NODE POOL ASSUMPTION:
-#   This manifest targets a dedicated GKE GPU node pool configured with:
-#     Machine type:  g2-standard-12 (NVIDIA L4, 24 GB VRAM)
-#     Node pool name: gpu-pool
-#     Node taint:    nvidia.com/gpu=present:NoSchedule  (auto-applied by GKE)
-#     GKE feature:   NVIDIA device plugin (auto-installed by GKE)
-#
-#   NVIDIA L4 is the cost-optimal choice for Mistral-7B-Instruct-v0.3 because:
-#     • Mistral-7B FP16 requires ~14 GB VRAM for weights + ~4 GB for KV cache
-#     • L4 has 24 GB VRAM — comfortable fit with room for long contexts
-#     • L4 is ~60% cheaper than A100-40GB for the same throughput on 7B models
-#     • GKE supports L4 natively with the g2-standard machine family
-#
-# MODEL VOLUME:
-#   The model PVC (`model-pvc`) is created in Phase 5 (Model Provisioning).
-#   It is backed by a GCS Fuse CSI PersistentVolume that mounts the model
-#   weights from a GCS bucket (Diagram 2: GCS Bucket → PVC/GCS Fuse CSI).
-#   This Deployment references it by name — it will bind automatically once
-#   the PVC exists in the same namespace.
-#
-# STARTUP TIME WARNING:
-#   vLLM loads 14 GB of model weights from the PVC on every cold start.
-#   Expected startup times:
-#     • From GCS Fuse (first mount, cold): 8–15 minutes
-#     • From GCS Fuse (cached by OS buffer): 3–6 minutes
-#     • From a pre-downloaded PD (Persistent Disk): 1–3 minutes
-#   The startupProbe is configured with a 15-minute timeout to handle
-#   the worst case. Do not reduce this without testing.
-#
-# APPLY ORDER: Requires Namespace (fastapi/00), ServiceAccount (vllm/00),
-#              and the model-pvc PersistentVolumeClaim (Phase 5) to exist.
-#
-# COMMAND: kubectl apply -f k8s/vllm/01-deployment.yaml
-# ROLLOUT:  kubectl rollout status deployment/vllm -n mistral-gateway
-# LOGS:     kubectl logs -l app=vllm -n mistral-gateway -f
-# =============================================================================
+
 
 apiVersion: apps/v1
 kind: Deployment
@@ -57,17 +13,8 @@ metadata:
     app.kubernetes.io/version: "0.6.3"
 
 spec:
-  # ── Replica count ────────────────────────────────────────────────────────────
-  # WHY 2 replicas?
-  #   Diagram 1 shows "vLLM Deployment (GPU Nodes)" with Pod 1, Pod 2, Pod 3.
-  #   2 is the production HA minimum — one pod can be down for rolling updates
-  #   or node maintenance while the other keeps serving requests.
-  #   HPA (Phase 6) will scale to 3 based on GPU utilisation.
-  #
-  # COST NOTE: Each replica requires 1 GPU node (g2-standard-12 ≈ $0.70/hr for
-  #   spot/preemptible). 2 replicas = 2 GPU nodes running 24/7 ≈ $1,000/month.
-  #   Use GKE node auto-provisioning + preemptible nodes in dev/staging to reduce cost.
-  replicas: 2
+  
+  replicas: 1
   revisionHistoryLimit: 3
   minReadySeconds: 30
   progressDeadlineSeconds: 1800
@@ -76,17 +23,11 @@ spec:
     matchLabels:
       app: vllm
 
-  # ── Update strategy ──────────────────────────────────────────────────────────
+  # ── Update strategy 
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      # WHY maxUnavailable: 1 (not 0 like FastAPI)?
-      #   GPU nodes are expensive. We cannot afford a 3rd GPU node just to run
-      #   the surge pod during a rolling update (maxSurge: 1 would require
-      #   temporarily provisioning an extra GPU node).
-      #   maxUnavailable: 1 means one pod is taken down before the new one starts.
-      #   There is a brief period with only 1 serving pod. This is acceptable
-      #   because model updates are infrequent and announced maintenance windows.
+     
       maxUnavailable: 1
       maxSurge: 0
 
@@ -100,86 +41,43 @@ spec:
         app.kubernetes.io/version: "0.6.3"
 
       annotations:
-        # Prometheus annotations for GPU metrics scraping.
-        # vLLM exposes /metrics in Prometheus format at port 8001.
-        # These will be consumed by the Prometheus stack (Diagram 3).
+      
+        gke-gcsfuse/volumes: "true"
+
+       
         prometheus.io/scrape: "true"
         prometheus.io/port: "8001"
         prometheus.io/path: "/metrics"
 
     spec:
-      # ── Service Account ────────────────────────────────────────────────────
+      # ── Service Account ────────────
       serviceAccountName: vllm-sa
       automountServiceAccountToken: false
       enableServiceLinks: false
 
-      # ── Pod-level security context ─────────────────────────────────────────
-      # WHY less restrictive than FastAPI?
-      #   CUDA/GPU workloads have specific OS-level requirements:
-      #     • They must write to /dev/shm (shared memory for IPC between GPU threads)
-      #     • NCCL (NVIDIA Collective Communications Library) uses shared memory
-      #       for multi-GPU coordination (relevant if tensor-parallel-size > 1)
-      #     • Some CUDA runtime operations temporarily need writable /tmp
-      #   We still apply non-root and seccomp — just not readOnlyRootFilesystem.
+     
       securityContext:
         runAsNonRoot: true
-        # WHY UID 1000? The vllm/vllm-openai Docker image creates a `vllm` user
-        # with UID 1000. We must match what the image expects.
+        
         runAsUser: 1000
         runAsGroup: 1000
         fsGroup: 1000
-        # Seccomp RuntimeDefault still blocks dangerous syscalls without
-        # interfering with CUDA operations.
+        
         seccompProfile:
           type: RuntimeDefault
 
-      # ── GPU node targeting ─────────────────────────────────────────────────
-      # WHY nodeSelector instead of nodeAffinity?
-      #   nodeSelector is simpler and sufficient when you have a single GPU pool.
-      #   nodeAffinity (preferred/required rules) is used when you have multiple
-      #   GPU types and want preference ordering. Use nodeAffinity in Phase 6
-      #   when adding A100 nodes alongside L4.
-      #
-      # These labels are applied automatically by GKE to nodes in the GPU pool:
-      #   cloud.google.com/gke-nodepool: gpu-pool  → targets the GPU node pool by name
-      #   cloud.google.com/gke-accelerator: nvidia-l4 → targets specifically L4 GPU nodes
-      #
-      # WHY both labels?
-      #   Targeting only `gke-accelerator` would match any L4 node in the cluster,
-      #   including those in other node pools with different configurations.
-      #   Adding `gke-nodepool` ensures we land only on our purpose-built GPU pool.
+    
       nodeSelector:
-        cloud.google.com/gke-nodepool: gpu-pool
+        cloud.google.com/gke-nodepool: mistral-cluster-gpu-pool
         cloud.google.com/gke-accelerator: nvidia-l4
 
-      # ── Tolerations ───────────────────────────────────────────────────────
-      # WHY tolerations?
-      #   GKE automatically taints GPU nodes to PREVENT non-GPU workloads
-      #   from landing on expensive GPU nodes and wasting GPU capacity.
-      #   The taint is: `nvidia.com/gpu=present:NoSchedule`
-      #
-      #   Without this toleration, the vLLM pod would be unschedulable on
-      #   GPU nodes and would sit in Pending state indefinitely.
-      #
-      #   `operator: Exists` matches any value for the taint key — it handles
-      #   both `nvidia.com/gpu=present:NoSchedule` and `nvidia.com/gpu:NoSchedule`
-      #   regardless of the taint value GKE uses.
+     
       tolerations:
         - key: "nvidia.com/gpu"
           operator: "Exists"
           effect: "NoSchedule"
 
-      # ── Topology spread ───────────────────────────────────────────────────
-      # WHY spread vLLM pods across zones?
-      #   If both vLLM replicas land on GPU nodes in the same GCP zone and
-      #   that zone has an outage, all inference capacity is lost.
-      #   Spreading across zones ensures zone-level fault tolerance.
-      #
-      # WHY whenUnsatisfiable: ScheduleAnyway (not DoNotSchedule like FastAPI)?
-      #   GPU nodes are scarce. If a zone only has 1 GPU node and both replicas
-      #   MUST be in different zones, the scheduler would refuse to place the
-      #   second pod. ScheduleAnyway allows violating the spread constraint
-      #   when no better option exists — availability over topology purity.
+      
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: topology.kubernetes.io/zone
@@ -198,28 +96,13 @@ spec:
                     app: vllm
                 topologyKey: kubernetes.io/hostname
 
-      # ── Termination grace period ───────────────────────────────────────────
-      # WHY 120 seconds?
-      #   vLLM may have in-flight inference requests taking up to 120 seconds
-      #   (matching VLLM_TIMEOUT_SECONDS in FastAPI's ConfigMap).
-      #   Kubernetes sends SIGTERM and waits this long before SIGKILL.
-      #   During this window, vLLM completes in-flight requests, then shuts down.
-      #   FastAPI's httpx client will timeout at 120s — matching this window.
+     
       terminationGracePeriodSeconds: 120
 
-      # ── Init container ─────────────────────────────────────────────────────
-      # WHY an init container?
-      #   Before vLLM starts, we verify the model files are present and complete
-      #   on the PVC. If the model download (Phase 5 K8s Job) has not finished,
-      #   this init container keeps retrying — preventing vLLM from starting with
-      #   an incomplete model and producing cryptic errors.
-      #
-      #   `ls -la` on the model directory + checks for required files confirms
-      #   the model is ready. The init container exits 0 only when the model
-      #   checkpoint files are present.
+      
       initContainers:
         - name: model-readiness-check
-          image: busybox:1.37.0   # Minimal image — only needs ls and test
+          image: busybox:1.37.0   
           securityContext:
             runAsNonRoot: true
             runAsUser: 1000
@@ -229,12 +112,7 @@ spec:
             capabilities:
               drop:
                 - ALL
-          # WHY this specific check?
-          #   Mistral-7B-Instruct-v0.3 is stored in safetensors format.
-          #   The presence of `config.json` and at least one `.safetensors` file
-          #   confirms the model download completed successfully.
-          #   Without this, vLLM would start, fail to load the model, and crash
-          #   in a restart loop (CrashLoopBackOff) that's hard to debug.
+          
           command:
             - sh
             - -c
@@ -251,10 +129,10 @@ spec:
           volumeMounts:
             - name: model-storage
               mountPath: /models
-              readOnly: true   # Init container only reads — never modifies model files
+              readOnly: true   
 
           resources:
-            # Minimal resources — this container just runs shell commands
+            
             requests:
               cpu: "50m"
               memory: "32Mi"
@@ -268,17 +146,7 @@ spec:
       containers:
         - name: vllm
 
-          # ── Image ──────────────────────────────────────────────────────────
-          # WHY vllm/vllm-openai and not vllm/vllm?
-          #   vllm/vllm-openai is the production image that bundles the OpenAI-
-          #   compatible API server (FastAPI + vLLM engine) into a single container.
-          #   It exposes /v1/chat/completions, /v1/models, /health — exactly what
-          #   our FastAPI gateway proxy expects.
-          #
-          # WHY v0.6.3.post1 (pinned)?
-          #   vLLM releases frequently and breaking changes are common.
-          #   A pinned version ensures reproducible builds and allows controlled
-          #   upgrades with testing. Never use :latest for GPU workloads in production.
+          
           image: vllm/vllm-openai:v0.6.3.post1
           imagePullPolicy: IfNotPresent
 
@@ -287,123 +155,70 @@ spec:
               containerPort: 8001   # Must match VLLM_BASE_URL port in FastAPI ConfigMap
               protocol: TCP
 
-          # ── vLLM startup arguments ─────────────────────────────────────────
-          # WHY args instead of a custom CMD?
-          #   The vllm/vllm-openai image ENTRYPOINT is `python -m vllm.entrypoints.openai.api_server`.
-          #   We pass all configuration as CLI arguments — no image rebuild needed
-          #   to change model, port, or memory settings.
+          
           args:
-            # ── Model configuration ──────────────────────────────────────────
-            # Path inside the container where the model weights are mounted.
-            # Must match the volumeMount.mountPath below (+ subdirectory).
+           
             - "--model"
             - "/models/mistral-7b-instruct"
 
-            # The name clients use in API requests: {"model": "mistralai/Mistral-7B-Instruct-v0.3"}
-            # Must match VLLM_MODEL_NAME in the FastAPI ConfigMap.
-            # If mismatched, FastAPI will receive "model not found" errors.
+            
             - "--served-model-name"
             - "mistralai/Mistral-7B-Instruct-v0.3"
 
             # ── Network ──────────────────────────────────────────────────────
             - "--host"
-            - "0.0.0.0"   # Bind all interfaces — required inside a pod
+            - "0.0.0.0"   
 
             - "--port"
-            - "8001"      # Must match containerPort and Service targetPort
+            - "8001"     
 
-            # ── GPU memory ───────────────────────────────────────────────────
-            # WHY 0.90?
-            #   vLLM uses GPU memory for two things:
-            #     1. Model weights: ~14 GB for Mistral-7B FP16
-            #     2. KV cache: stores attention key/value tensors for active requests
-            #   0.90 reserves 10% for CUDA overhead, PyTorch buffers, and
-            #   activations. On a 24 GB L4: 0.90 × 24 GB = 21.6 GB usable.
-            #   14 GB weights → 7.6 GB remaining for KV cache = ~10–15 concurrent requests.
-            #   Increase to 0.95 only after verifying no OOM errors under load.
+            
             - "--gpu-memory-utilization"
             - "0.90"
 
-            # ── Context length ───────────────────────────────────────────────
-            # WHY 4096?
-            #   Mistral-7B-Instruct-v0.3 supports up to 32,768 token context.
-            #   However, larger max-model-len increases KV cache memory per slot.
-            #   4096 matches MAX_TOKENS_LIMIT in the FastAPI ConfigMap and provides
-            #   a good balance between capability and memory efficiency.
-            #   Increase to 8192 or 16384 for long-context use cases (requires
-            #   testing for OOM on L4's 24 GB).
+           
             - "--max-model-len"
             - "4096"
 
-            # ── Data type ────────────────────────────────────────────────────
-            # WHY auto?
-            #   `auto` lets vLLM select the best dtype for the GPU:
-            #     • L4 → float16 (no native bfloat16 support)
-            #     • A100/H100 → bfloat16 (more numerically stable)
-            #   Using `auto` makes this manifest GPU-portable without changes.
+            
             - "--dtype"
             - "auto"
 
-            # ── Parallelism ──────────────────────────────────────────────────
-            # WHY tensor-parallel-size 1?
-            #   Mistral-7B fits on a single L4 GPU (24 GB). Tensor parallelism
-            #   splits the model across multiple GPUs and is only needed for
-            #   models > GPU VRAM (e.g., 70B models requiring 2–4 GPUs).
-            #   With 1 GPU per pod, tensor-parallel-size must be 1.
-            #   For multi-GPU pods, increase this and add more GPU resources below.
+           
             - "--tensor-parallel-size"
             - "1"
 
-            # ── Logging ──────────────────────────────────────────────────────
-            # WHY disable-log-requests?
-            #   Without this flag, vLLM logs every request including the full
-            #   prompt text — creating massive log volume and potential PII leakage.
-            #   Our structured logging middleware (FastAPI side) already captures
-            #   request metadata (method, path, latency, request_id).
+            
             - "--disable-log-requests"
 
-            # ── Uvicorn log level ─────────────────────────────────────────────
-            # Suppress Uvicorn's noisy INFO access logs in production.
-            # vLLM's own engine logs (model loading progress, batch stats) still appear.
+            
             - "--uvicorn-log-level"
             - "warning"
 
-          # ── Environment variables ──────────────────────────────────────────
+          
           env:
-            # ── CUDA shared memory ───────────────────────────────────────────
-            # WHY CUDA_VISIBLE_DEVICES=0?
-            #   Explicitly sets which GPU the container sees. With Kubernetes
-            #   GPU resource limits (`nvidia.com/gpu: 1`), the device plugin
-            #   already isolates the GPU. This env var is belt-and-suspenders —
-            #   prevents vLLM from trying to use a second GPU if the device
-            #   plugin assignment is somehow misconfigured.
+           
             - name: CUDA_VISIBLE_DEVICES
               value: "0"
 
-            # WHY NCCL_P2P_DISABLE=1?
-            #   NCCL peer-to-peer GPU communication (GPUDirect) requires specific
-            #   kernel features and NVLink. On GKE L4 nodes (which use PCIe, not
-            #   NVLink), P2P is either unavailable or slower than disabled mode.
-            #   Disabling it prevents NCCL from attempting P2P and falling back
-            #   to slower paths silently. With tensor-parallel-size=1, NCCL is
-            #   not used, but this is a safety setting for future multi-GPU expansion.
+            
             - name: NCCL_P2P_DISABLE
               value: "1"
 
-            # WHY TRANSFORMERS_CACHE?
-            #   Hugging Face Transformers caches tokenizer configs and model card
-            #   data to disk. Setting this to a writable path prevents crashes
-            #   when the root filesystem is constrained or limited.
-            #   /tmp is writable (backed by our emptyDir tmpfs volume below).
+            
             - name: TRANSFORMERS_CACHE
               value: "/tmp/hf-cache"
 
-            # WHY HF_HOME?
-            #   Hugging Face home directory for config and token storage.
-            #   The model is loaded from the PVC (/models/...) directly —
-            #   HF_HOME is only for the Hugging Face Hub client metadata.
+            
             - name: HF_HOME
               value: "/tmp/hf-home"
+
+            # Set writable HOME and disable usage stats writing to /.config
+            - name: HOME
+              value: "/tmp"
+
+            - name: VLLM_NO_USAGE_STATS
+              value: "1"
 
             # Downward API — pod identity for log correlation
             - name: POD_NAME
@@ -421,91 +236,41 @@ spec:
                 fieldRef:
                   fieldPath: spec.nodeName
 
-          # ── Resource requests and limits ───────────────────────────────────
+          # ── Resource requests and limits ─────────────
           resources:
             requests:
-              # WHY 4 CPUs?
-              #   vLLM uses CPU for:
-              #     • Tokenization (encoding input prompts)
-              #     • Detokenization (decoding output tokens)
-              #     • Request scheduling and batching logic
-              #     • Uvicorn HTTP server threads
-              #   4 vCPUs provides enough throughput for ~10 concurrent requests
-              #   without CPU bottlenecking the GPU. g2-standard-12 has 12 vCPUs —
-              #   4 per pod leaves capacity for 2 pods on the same node family.
+             
               cpu: "4"
 
-              # WHY 16Gi memory?
-              #   CPU-side memory is separate from GPU VRAM:
-              #     • PyTorch buffers: ~2 GB
-              #     • Python runtime + vLLM overhead: ~1 GB
-              #     • Request queue and response buffering: ~2 GB
-              #     • Hugging Face tokenizer (loaded fully in RAM): ~500 MB
-              #     • OS buffer cache (read-ahead for model files): ~8 GB
-              #   16 Gi covers normal operation with headroom.
+           
               memory: "16Gi"
               ephemeral-storage: "2Gi"
 
-              # ── GPU resource ─────────────────────────────────────────────────
-              # WHY nvidia.com/gpu: "1"?
-              #   This is the NVIDIA device plugin resource type, not a standard
-              #   Kubernetes resource. The GKE NVIDIA device plugin (auto-installed)
-              #   advertises this resource on GPU nodes.
-              #
-              #   Setting requests = limits for GPU is MANDATORY:
-              #     • GPUs are non-divisible resources — you cannot request 0.5 GPU
-              #     • Kubernetes requires requests == limits for extended resources
-              #     • The scheduler uses the request to find a node with a free GPU
-              #     • The device plugin mounts the GPU device files into the container
-              #
-              #   Requesting 1 GPU grants exclusive access to 1 physical L4 GPU
-              #   (all 24 GB VRAM). No other pod can share this GPU.
+            
               nvidia.com/gpu: "1"
 
             limits:
-              cpu: "8"         # Allow bursting to 8 CPUs during heavy tokenization
-              memory: "24Gi"   # Hard limit — OOMKilled if exceeded
+              cpu: "8"         
+              memory: "24Gi"   
               ephemeral-storage: "8Gi"
-              # GPU limit must equal request — Kubernetes requirement for GPUs
+              
               nvidia.com/gpu: "1"
 
-          # ── Liveness probe ─────────────────────────────────────────────────
-          # WHY NOT checking /v1/models for liveness?
-          #   /health is the lightest endpoint — just returns 200.
-          #   /v1/models lists all loaded models and does more work.
-          #   For liveness (deadlock detection), we only need the process
-          #   to be alive and responsive, not necessarily serving models.
-          #
-          # NOTE: The startupProbe below DISABLES liveness until the model
-          #   is fully loaded. These liveness timings only apply AFTER startup.
-          #   During model loading (5–15 min), liveness is bypassed entirely.
+         
           livenessProbe:
             httpGet:
               path: /health
               port: http
               scheme: HTTP
-            # WHY initialDelaySeconds: 0?
-            #   startupProbe handles the startup period. Once startupProbe
-            #   succeeds (model loaded), liveness starts immediately.
+            
             initialDelaySeconds: 0
-            # WHY periodSeconds: 30?
-            #   vLLM inference can block the event loop for seconds during
-            #   long completions. A 30s period prevents false positives from
-            #   a temporarily busy event loop.
+            
             periodSeconds: 30
             timeoutSeconds: 10
             failureThreshold: 3    # 3 × 30s = 90 seconds before restart
             successThreshold: 1
 
-          # ── Readiness probe ────────────────────────────────────────────────
-          # WHY /health for readiness too?
-          #   vLLM's /health endpoint returns 200 only when the model is fully
-          #   loaded and the API server is ready to accept requests.
-          #   During model loading, /health returns 503 — automatically
-          #   removing the pod from the Service endpoints until it's ready.
-          #
-          #   This is the key probe for production: FastAPI pods will not
-          #   receive a vLLM endpoint until /health returns 200.
+         
           readinessProbe:
             httpGet:
               path: /health
@@ -517,43 +282,15 @@ spec:
             failureThreshold: 3
             successThreshold: 1
 
-          # ── Startup probe ──────────────────────────────────────────────────
-          # WHY startupProbe is CRITICAL for vLLM?
-          #   This is the most important probe in this entire manifest.
-          #
-          #   Without startupProbe:
-          #     liveness probe starts at initialDelaySeconds (e.g., 10s)
-          #     vLLM is still loading the model at 10s
-          #     /health returns 503
-          #     failureThreshold reached after 3 failures (~45s)
-          #     Kubernetes RESTARTS the pod
-          #     vLLM starts loading again → infinite restart loop
-          #     Pod never reaches Running state → CrashLoopBackOff
-          #
-          #   With startupProbe:
-          #     liveness and readiness are DISABLED until startupProbe succeeds
-          #     startupProbe has up to 15 minutes (90 × 10s) to succeed
-          #     Once model is loaded, /health returns 200 → startupProbe succeeds
-          #     liveness and readiness probes activate — normal operation begins
-          #
-          # Timeline:
-          #   0m      — container starts, vLLM begins loading model from PVC
-          #   0-10m   — startupProbe checks /health every 10s, gets 503, retries
-          #   ~8-12m  — model fully loaded, /health returns 200
-          #   ~8-12m  — startupProbe succeeds, liveness + readiness activate
-          #   ~8-12m  — pod added to Service endpoints, FastAPI starts routing to it
+          
           startupProbe:
             httpGet:
               path: /health
               port: http
               scheme: HTTP
-            # WHY initialDelaySeconds: 60?
-            #   vLLM cannot possibly be ready in under 60 seconds (model loading).
-            #   Waiting 60 seconds before the first check avoids 6 wasted probe
-            #   attempts and the associated log noise.
+            
             initialDelaySeconds: 60
-            # 90 attempts × 10 seconds = 900 seconds = 15 minutes maximum
-            # This covers GCS Fuse cold-mount worst case.
+            
             periodSeconds: 10
             timeoutSeconds: 10
             failureThreshold: 90
@@ -563,89 +300,42 @@ spec:
           securityContext:
             runAsNonRoot: true
             allowPrivilegeEscalation: false
-            # WHY NOT readOnlyRootFilesystem: true for vLLM?
-            #   CUDA runtime writes temporary files during GPU kernel compilation
-            #   (JIT compilation of CUDA kernels on first run) to /root or /tmp.
-            #   The compiled kernels are cached for subsequent runs.
-            #   Setting readOnlyRootFilesystem would cause:
-            #     CUDA error: cannot write to read-only filesystem
-            #   We mitigate this by mounting writable tmpfs at /tmp (below).
-            #   readOnlyRootFilesystem: false is the pragmatic choice for GPU workloads.
+            
             readOnlyRootFilesystem: false
             capabilities:
               drop:
-                - ALL   # Still drop all capabilities — GPU access does not require any
+                - ALL   
 
           # ── Volume mounts ──────────────────────────────────────────────────
           volumeMounts:
-            # ── Model weights ─────────────────────────────────────────────────
-            # WHY readOnly: true for the model volume?
-            #   vLLM only reads model weights — it never writes to them.
-            #   readOnly prevents accidental corruption of the shared model data.
-            #   The PVC may be mounted by multiple pods simultaneously (ReadOnlyMany
-            #   access mode on GCS Fuse CSI volumes supports this).
+           
             - name: model-storage
               mountPath: /models
               readOnly: true
 
-            # ── Shared memory ─────────────────────────────────────────────────
-            # WHY mount tmpfs at /dev/shm?
-            #   CUDA uses POSIX shared memory (shm) for inter-process GPU data
-            #   transfer and for coordinating between the CPU and GPU.
-            #   The default /dev/shm size in a container is 64 MB, which is
-            #   insufficient for vLLM's KV cache sharing and NCCL communications.
-            #
-            #   We mount a tmpfs (RAM-backed) volume at /dev/shm with 2 Gi.
-            #   This is separate from the emptyDir at /tmp.
-            #   Without this, vLLM may crash with:
-            #     RuntimeError: CUDA out of memory (even when GPU VRAM is available)
-            #     or: OSError: [Errno 28] No space left on device
+           
             - name: shm
               mountPath: /dev/shm
 
-            # ── Temporary files ────────────────────────────────────────────────
-            # Hugging Face cache (TRANSFORMERS_CACHE, HF_HOME),
-            # CUDA kernel JIT compilation cache, Python tempfile operations.
+            
             - name: tmp
               mountPath: /tmp
 
       # ── Volumes ────────────────────────────────────────────────────────────
       volumes:
-        # ── Model PVC ──────────────────────────────────────────────────────────
-        # WHY PersistentVolumeClaim?
-        #   The model PVC is created in Phase 5 (Model Provisioning).
-        #   It is backed by either:
-        #     Option A: GCS Fuse CSI PersistentVolume (Diagram 2 architecture)
-        #       → mounts the GCS bucket directly as a filesystem
-        #       → always reflects the latest model in GCS
-        #       → slower reads (~300 MB/s vs disk's ~1 GB/s)
-        #
-        #     Option B: Pre-downloaded ReadOnlyMany PersistentDisk
-        #       → model copied from GCS to disk by a K8s Job (Phase 5)
-        #       → faster reads (SSD: ~1 GB/s)
-        #       → requires re-running the Job after model updates
-        #
-        #   The PVC name `model-pvc` is agreed between this Deployment and
-        #   the Phase 5 provisioning manifests. Both must use the same name
-        #   and namespace (mistral-gateway).
+        
         - name: model-storage
           persistentVolumeClaim:
             claimName: model-pvc    # Created in Phase 5 — Model Provisioning
             readOnly: true
 
-        # ── Shared memory volume ───────────────────────────────────────────────
-        # medium: Memory = tmpfs (RAM-backed, not written to disk)
-        # sizeLimit prevents a runaway process from consuming all node RAM.
-        # 2 Gi is sufficient for Mistral-7B's KV cache sharing needs.
+       
         - name: shm
           emptyDir:
             medium: Memory
             sizeLimit: "2Gi"
 
-        # ── Temporary directory ─────────────────────────────────────────────────
-        # Hugging Face caches, CUDA compiled kernels, Python tempfiles.
-        # 4 Gi allows CUDA to cache compiled GPU kernels across restarts
-        # (cached in /tmp/hf-cache which is lost on pod restart — acceptable).
+        
         - name: tmp
           emptyDir:
             medium: Memory

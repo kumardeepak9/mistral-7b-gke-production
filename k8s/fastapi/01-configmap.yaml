@@ -1,32 +1,10 @@
-# =============================================================================
-# k8s/fastapi/01-configmap.yaml
-#
-# WHY ConfigMap and not env vars baked into the Docker image?
-#   • Separation of config from code — the same Docker image runs in dev,
-#     staging, and production with different ConfigMaps. No rebuild needed.
-#   • Auditability — `kubectl describe configmap` shows current config without
-#     exec-ing into a running container.
-#   • GitOps-friendly — ConfigMap changes are tracked in Git alongside code.
-#
-# WHAT goes in ConfigMap vs Secret?
-#   ConfigMap  → Non-sensitive configuration. Safe if leaked.
-#                Examples: log level, worker count, model name, service URLs.
-#   Secret     → Sensitive values. Damaging if leaked.
-#                Examples: API keys, passwords, TLS certificates.
-#
-# HOW it connects to the app:
-#   The Deployment uses `envFrom: configMapRef` to inject ALL keys from this
-#   ConfigMap as environment variables into every container. pydantic-settings
-#   reads them at startup via Settings() in app/config.py.
-#
-# COMMAND: kubectl apply -f k8s/fastapi/01-configmap.yaml
-# =============================================================================
 
-apiVersion: v1      # ConfigMap is a core Kubernetes resource
+
+apiVersion: v1     
 kind: ConfigMap
 metadata:
-  name: fastapi-config           # Referenced in Deployment.spec.containers[].envFrom
-  namespace: mistral-gateway     # Must match the namespace in 00-namespace.yaml
+  name: fastapi-config           
+  namespace: mistral-gateway     
 
   labels:
     app.kubernetes.io/name: mistral-inference-gateway
@@ -34,55 +12,35 @@ metadata:
     app.kubernetes.io/part-of: mistral-gateway
 
 data:
-  # ── Application ──────────────────────────────────────────────────────────────
-  # Tells the app it is running in production. Affects:
-  #   • CORS policy (locked down in production, see app/main.py)
-  #   • Uvicorn reload (disabled in production)
-  #   • Log level defaults
+  
   APP_ENV: "production"
 
-  # Semantic version — must match the Docker image tag pushed to Artifact Registry.
-  # Updated by CI (GitHub Actions) during the build pipeline (Phase 5).
+ 
   APP_VERSION: "0.1.0"
 
-  # Log verbosity. INFO is correct for production.
-  # DEBUG would generate ~10x more log volume and increase Cloud Logging costs.
+ 
   LOG_LEVEL: "INFO"
 
-  # ── Server ───────────────────────────────────────────────────────────────────
-  # Bind to all interfaces inside the container. Never use 127.0.0.1 in a pod —
-  # the kubelet health probe comes from the node IP, not localhost.
+ 
   HOST: "0.0.0.0"
 
-  # Must match EXPOSE and containerPort in the Deployment.
+ 
   PORT: "8000"
 
-  # Number of Uvicorn worker processes per pod.
-  # Formula: 2 × CPU cores (GKE e2-medium = 1 vCPU → 2 workers).
-  # In GKE, horizontal scaling (HPA) adds pods; vertical scaling (more workers)
-  # adds processes per pod. 2 workers handles I/O-bound concurrency well.
+ 
   WORKERS: "2"
 
-  # ── vLLM Backend ─────────────────────────────────────────────────────────────
-  # Fully-qualified Kubernetes DNS name for the vLLM ClusterIP Service.
-  # Format: <service-name>.<namespace>.svc.cluster.local:<port>
-  # This is resolvable only inside the cluster — never reachable from the internet.
-  # The short form "http://vllm-service:8001" also works within the same namespace.
+ 
   VLLM_BASE_URL: "http://vllm-service.mistral-gateway.svc.cluster.local:8001"
 
-  # Model identifier forwarded in every OpenAI-compatible API request to vLLM.
-  # Must match the --model argument used when starting the vLLM server (Phase vLLM).
+
   VLLM_MODEL_NAME: "mistralai/Mistral-7B-Instruct-v0.3"
 
-  # Maximum seconds to wait for vLLM to respond. Inference on a 7B model
-  # with long prompts can take 60–90 seconds. 120s provides headroom.
-  # If this fires, the FastAPI pod returns HTTP 504 Gateway Timeout.
+ 
   VLLM_TIMEOUT_SECONDS: "120"
 
-  # ── Request Limits ───────────────────────────────────────────────────────────
-  # Hard ceiling on max_tokens — prevents a single request from consuming
-  # the entire GPU's memory budget and starving other users.
+ 
   MAX_TOKENS_LIMIT: "4096"
 
-  # Default token limit when the caller omits max_tokens in their request.
+  
   DEFAULT_MAX_TOKENS: "512"

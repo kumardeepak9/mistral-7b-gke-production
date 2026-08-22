@@ -1,53 +1,29 @@
-# =============================================================================
 # docker-compose.yml
-#
-# WHY: Kubernetes is not needed to smoke-test the Docker image locally.
-#      This file lets you run `docker compose up` and hit all endpoints
-#      (/, /health, /ready, /docs, /v1/chat/completions) from your browser
-#      or curl, verifying the image is correctly built before pushing to
-#      Artifact Registry.
-#
-# IMPORTANT: This file is for LOCAL DEVELOPMENT ONLY.
-#      Production runs on GKE (Phase 3+). Never run docker compose in prod.
-#
-# Usage:
-#   Build and start:  docker compose up --build
-#   Stop:             docker compose down
-#   View logs:        docker compose logs -f fastapi
-# =============================================================================
 
 services:
   fastapi:
     # ── Build ──────────────────────────────────────────────────────────────
-    # `build: .` tells compose to run `docker build .` using the Dockerfile
-    # in the current directory. The `target: runtime` ensures we only build
-    # up to the runtime stage (not just the builder stage, which has no CMD).
+
     build:
       context: .
       dockerfile: Dockerfile
       target: runtime
       args:
-        # Pass the version at build time so it appears in / and /health responses
+
         APP_VERSION: "0.1.0"
 
-    # ── Image name ─────────────────────────────────────────────────────────
-    # Matches the name that will be pushed to GCP Artifact Registry in Phase 4.
-    # Format: <region>-docker.pkg.dev/<project>/<repo>/<image>:<tag>
     image: mistral-inference-gateway:dev
 
-    # ── Container name ─────────────────────────────────────────────────────
+    # ── Container name ───────────────────────
     container_name: mistral-fastapi-dev
 
-    # ── Port mapping ───────────────────────────────────────────────────────
-    # Maps host port 8000 → container port 8000.
-    # Access via: http://localhost:8000
+    # ── Port mapping ─────────────────────
+
     ports:
       - "8000:8000"
 
-    # ── Environment variables ──────────────────────────────────────────────
-    # In production these come from Kubernetes ConfigMaps and Secrets.
-    # Here we set development-appropriate values so the app starts cleanly
-    # even without a vLLM backend running.
+    # ── Environment variables ───────────────────────
+
     environment:
       APP_ENV: development
       APP_VERSION: "0.1.0"
@@ -55,8 +31,7 @@ services:
       HOST: "0.0.0.0"
       PORT: "8000"
       WORKERS: "1"
-      # vLLM is not running locally — the inference stub will respond instead.
-      # This URL will be a real GKE ClusterIP in production.
+
       VLLM_BASE_URL: "http://localhost:8001"
       VLLM_MODEL_NAME: "mistralai/Mistral-7B-Instruct-v0.3"
       VLLM_TIMEOUT_SECONDS: "30"
@@ -64,26 +39,20 @@ services:
       DEFAULT_MAX_TOKENS: "512"
 
     # ── Health check ───────────────────────────────────────────────────────
-    # Docker Compose waits for this before marking the service as healthy.
-    # Mirrors the HEALTHCHECK in the Dockerfile but adds retries for slow
-    # startup on a cold machine.
+
     healthcheck:
-      test: ["CMD", "python", "-c",
-             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" ]
       interval: 15s
       timeout: 5s
       retries: 5
       start_period: 10s
 
     # ── Restart policy ─────────────────────────────────────────────────────
-    # `unless-stopped` keeps the container running through host reboots
-    # during local dev sessions, but does not restart it if you explicitly
-    # stop it with `docker compose down`.
+
     restart: unless-stopped
 
     # ── Resource limits ────────────────────────────────────────────────────
-    # Mirrors the GKE resource requests/limits we will set in Phase 3.
-    # Running within these limits locally catches OOM issues before deploying.
+
     deploy:
       resources:
         limits:
@@ -94,20 +63,11 @@ services:
           memory: "128M"
 
     # ── Read-only root filesystem ──────────────────────────────────────────
-    # WHY: Matches the GKE SecurityContext we will apply in Phase 3:
-    #   securityContext:
-    #     readOnlyRootFilesystem: true
-    # Running with this flag locally ensures the app doesn't accidentally
-    # write to the container filesystem (e.g., .pyc files, temp files),
-    # which would fail in the GKE hardened environment.
-    # PYTHONDONTWRITEBYTECODE=1 in the Dockerfile prevents .pyc write attempts.
+
     read_only: true
 
     # ── Tmpfs mounts ───────────────────────────────────────────────────────
-    # A read-only root filesystem blocks ALL writes. Some system calls still
-    # need writable temp space (e.g., uvicorn's worker IPC, Python tempfile).
-    # We mount tmpfs (in-memory) at the standard temp paths — writable but
-    # not persisted and never baked into the image.
+
     tmpfs:
       - /tmp
       - /var/tmp

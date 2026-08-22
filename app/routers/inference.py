@@ -1,125 +1,59 @@
-# ─────────────────────────────────────────────────────────────────────────────
-# app/routers/inference.py
-#
-# WHY: From Diagram 1, the FastAPI pods make "OpenAI API Calls" to the vLLM
-#      Service (ClusterIP).  vLLM exposes an OpenAI-compatible REST API, so
-#      this router acts as an authenticated, rate-limited proxy between the
-#      GKE Ingress and the vLLM backend.
-#
-#      This file is a STUB in Phase 1.  It establishes:
-#        • The correct URL prefix (/v1) that matches vLLM's OpenAI-compatible API
-#        • The httpx async client lifecycle (created once, reused across requests)
-#        • The request/response Pydantic schemas
-#        • The proxy forwarding pattern (Phase 2 will complete the vLLM call)
-#
-#      Separating this into its own router keeps main.py clean and allows the
-#      inference logic to be tested independently.
-# ─────────────────────────────────────────────────────────────────────────────
-
 import logging
-from typing import Any
+from collections.abc import AsyncIterator
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request, status
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, HTTPException, Request, Response, status
+from fastapi.responses import StreamingResponse
 
 from app.config import settings
+from app.schemas import ChatCompletionRequest, ChatCompletionResponse, ErrorResponse
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1", tags=["inference"])
 
-# ── Shared async HTTP client ──────────────────────────────────────────────────
-# Created once and stored on app.state in main.py lifespan.
-# Retrieved here via the Request object to avoid module-level state.
-# This pattern ensures connection pooling is shared across all requests.
+
+def _build_upstream_headers(request: Request) -> dict[str, str]:
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    request_id = getattr(request.state, "request_id", None)
+    if request_id:
+        headers["X-Request-ID"] = request_id
+    if "Authorization" in request.headers:
+        headers["Authorization"] = request.headers["Authorization"]
+    return headers
 
 
-# ── Request / Response schemas ────────────────────────────────────────────────
-class ChatMessage(BaseModel):
-    """A single message in an OpenAI-compatible chat conversation."""
-
-    role: str = Field(..., description="'system', 'user', or 'assistant'")
-    content: str = Field(..., description="Message text content")
-
-
-class ChatCompletionRequest(BaseModel):
-    """
-    OpenAI-compatible /v1/chat/completions request body.
-
-    We validate max_tokens against settings.max_tokens_limit to prevent
-    runaway inference costs — a production guard not present in raw vLLM.
-    """
-
-    model: str = Field(
-        default_factory=lambda: settings.vllm_model_name,
-        description="Model identifier. Defaults to the configured vLLM model.",
-    )
-    messages: list[ChatMessage] = Field(
-        ...,
-        min_length=1,
-        description="Conversation history. Must contain at least one message.",
-    )
-    max_tokens: int = Field(
-        default_factory=lambda: settings.default_max_tokens,
-        ge=1,
-        description="Maximum tokens to generate.",
-    )
-    temperature: float = Field(
-        default=0.7,
-        ge=0.0,
-        le=2.0,
-        description="Sampling temperature.",
-    )
-    stream: bool = Field(
-        default=False,
-        description="Streaming not yet implemented. Must be false in Phase 1.",
-    )
+def _ensure_http_client(request: Request) -> httpx.AsyncClient:
+    http_client = getattr(request.app.state, "http_client", None)
+    if not isinstance(http_client, httpx.AsyncClient):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Inference backend client is not available",
+        )
+    return http_client
 
 
-class ChatCompletionResponse(BaseModel):
-    """Passthrough of vLLM's OpenAI-compatible response."""
-
-    # We return the raw vLLM JSON rather than re-validating it,
-    # so the schema here is intentionally permissive.
-    pass
-
-
-# ── Endpoints ─────────────────────────────────────────────────────────────────
 @router.post(
     "/chat/completions",
     summary="Chat completions (vLLM proxy)",
     description=(
         "Proxies an OpenAI-compatible chat completion request to the vLLM "
-        "backend running on GPU nodes inside the GKE cluster. "
-        "**Phase 1 stub** — returns a placeholder response until Phase 2."
+        "backend running on GPU nodes inside the GKE cluster."
     ),
     status_code=status.HTTP_200_OK,
+    response_model=ChatCompletionResponse,
+    responses={
+        status.HTTP_422_UNPROCESSABLE_ENTITY: {"model": ErrorResponse},
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": ErrorResponse},
+        status.HTTP_502_BAD_GATEWAY: {"model": ErrorResponse},
+        status.HTTP_503_SERVICE_UNAVAILABLE: {"model": ErrorResponse},
+        status.HTTP_504_GATEWAY_TIMEOUT: {"model": ErrorResponse},
+    },
 )
 async def chat_completions(
     request: Request,
     body: ChatCompletionRequest,
-) -> Any:
-    """
-    Phase 1 stub for the vLLM proxy endpoint.
-
-    Production behaviour (Phase 2):
-      1. Validate and sanitise the incoming request
-      2. Enforce max_tokens ceiling
-      3. Forward to vLLM via httpx (reusing the shared client from app.state)
-      4. Return vLLM's raw JSON response
-
-    Currently returns a static placeholder so the endpoint is testable
-    and OpenAPI docs are accurate.
-    """
-    # ── Guard: streaming not yet supported ────────────────────────────────
-    if body.stream:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Streaming is not yet implemented. Set stream=false.",
-        )
-
-    # ── Guard: max_tokens ceiling ─────────────────────────────────────────
+) -> Response | ChatCompletionResponse:
     if body.max_tokens > settings.max_tokens_limit:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -130,34 +64,120 @@ async def chat_completions(
         )
 
     request_id = getattr(request.state, "request_id", "unknown")
+    http_client = _ensure_http_client(request)
+    payload = body.model_dump(mode="json")
+    headers = _build_upstream_headers(request)
+
     logger.info(
-        "Inference request received (Phase 1 stub)",
+        "Forwarding inference request to vLLM",
         extra={
             "request_id": request_id,
             "model": body.model,
             "message_count": len(body.messages),
             "max_tokens": body.max_tokens,
+            "stream": body.stream,
         },
     )
 
-    # ── Phase 1 stub response — replaced in Phase 2 ───────────────────────
-    return {
-        "id": f"chatcmpl-stub-{request_id}",
-        "object": "chat.completion",
-        "model": body.model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": (
-                        "[Phase 1 stub] vLLM proxy not yet wired. "
-                        "This endpoint will forward to the vLLM ClusterIP "
-                        f"at {settings.vllm_base_url} in Phase 2."
-                    ),
-                },
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    if body.stream:
+        return await _stream_chat_completions(
+            http_client=http_client,
+            payload=payload,
+            headers=headers,
+        )
+
+    try:
+        upstream_response = await http_client.post(
+            "/v1/chat/completions",
+            json=payload,
+            headers=headers,
+        )
+    except httpx.TimeoutException as exc:
+        logger.warning("vLLM upstream timed out", extra={"request_id": request_id})
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="vLLM upstream request timed out",
+        ) from exc
+    except httpx.RequestError as exc:
+        logger.error("vLLM upstream request error", extra={"request_id": request_id, "error": str(exc)})
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Unable to reach vLLM upstream",
+        ) from exc
+
+    if upstream_response.status_code >= 400:
+        logger.warning(
+            "vLLM upstream returned error response",
+            extra={"request_id": request_id, "status_code": upstream_response.status_code},
+        )
+        raise HTTPException(
+            status_code=upstream_response.status_code,
+            detail=upstream_response.text or "vLLM upstream request failed",
+        )
+
+    try:
+        response_payload = upstream_response.json()
+    except ValueError as exc:
+        logger.error("vLLM upstream returned non-JSON payload", extra={"request_id": request_id})
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="vLLM upstream returned an invalid response payload",
+        ) from exc
+
+    return ChatCompletionResponse.model_validate(response_payload)
+
+
+async def _stream_chat_completions(
+    *,
+    http_client: httpx.AsyncClient,
+    payload: dict[str, object],
+    headers: dict[str, str],
+) -> StreamingResponse:
+    try:
+        upstream_stream = http_client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json=payload,
+            headers=headers,
+        )
+        stream_context = upstream_stream.__aenter__()
+        upstream_response = await stream_context
+    except httpx.TimeoutException as exc:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="vLLM upstream request timed out",
+        ) from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Unable to reach vLLM upstream",
+        ) from exc
+
+    if upstream_response.status_code >= 400:
+        error_body = await upstream_response.aread()
+        await upstream_stream.__aexit__(None, None, None)
+        raise HTTPException(
+            status_code=upstream_response.status_code,
+            detail=error_body.decode("utf-8", errors="replace") or "vLLM upstream stream failed",
+        )
+
+    async def iterator() -> AsyncIterator[bytes]:
+        try:
+            async for chunk in upstream_response.aiter_bytes():
+                if chunk:
+                    yield chunk
+        finally:
+            await upstream_stream.__aexit__(None, None, None)
+
+    passthrough_headers = {
+        key: value
+        for key, value in upstream_response.headers.items()
+        if key.lower() in {"cache-control", "connection", "x-request-id"}
     }
+
+    return StreamingResponse(
+        iterator(),
+        media_type=upstream_response.headers.get("content-type", "text/event-stream"),
+        headers=passthrough_headers,
+        status_code=upstream_response.status_code,
+    )

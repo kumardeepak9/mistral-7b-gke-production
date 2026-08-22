@@ -1,0 +1,111 @@
+
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: mistral-inference-alerts
+  namespace: monitoring
+  labels:
+    release: prometheus-stack
+    app.kubernetes.io/part-of: mistral-gateway
+spec:
+  groups:
+    - name: mistral-inference.rules
+      rules:
+     
+        - alert: VLLMPodDown
+          expr: kube_deployment_status_replicas_ready{deployment="vllm", namespace="mistral-gateway"} < 1
+          for: 1m
+          labels:
+            severity: critical
+            component: inference-engine
+          annotations:
+            summary: "vLLM Inference Server is DOWN"
+            description: "No ready replicas for vLLM deployment in namespace mistral-gateway for over 1 minute."
+
+        - alert: FastAPIPodDown
+          expr: kube_deployment_status_replicas_ready{deployment="fastapi", namespace="mistral-gateway"} < 1
+          for: 1m
+          labels:
+            severity: critical
+            component: api-gateway
+          annotations:
+            summary: "FastAPI Gateway is DOWN"
+            description: "No ready replicas for FastAPI gateway in namespace mistral-gateway for over 1 minute."
+
+    
+        - alert: HighAPILatency
+          expr: histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{namespace="mistral-gateway"}[2m]))) > 10
+          for: 2m
+          labels:
+            severity: warning
+            component: api-gateway
+          annotations:
+            summary: "High API Request Latency (p95 > 10s)"
+            description: "FastAPI p95 latency is {{ $value }}s (> 10s threshold) for 2 minutes."
+
+        
+        - alert: HighHTTP5xxRate
+          expr: (sum(rate(http_requests_total{namespace="mistral-gateway", status=~"5.."}[2m])) / sum(rate(http_requests_total{namespace="mistral-gateway"}[2m]))) * 100 > 5
+          for: 2m
+          labels:
+            severity: critical
+            component: api-gateway
+          annotations:
+            summary: "High HTTP 5xx Error Rate (> 5%)"
+            description: "FastAPI 5xx error rate is currently {{ $value }}%."
+
+ 
+        - alert: GPUHighTemperature
+          expr: DCGM_FI_DEV_GPU_TEMP > 85
+          for: 3m
+          labels:
+            severity: warning
+            component: gpu-hardware
+          annotations:
+            summary: "NVIDIA GPU Temperature Critical (> 85°C)"
+            description: "GPU {{ $labels.gpu }} on node {{ $labels.node }} temperature is {{ $value }}°C."
+
+        
+        - alert: GPUMemoryExhaustion
+          expr: (DCGM_FI_DEV_FB_USED / (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE)) * 100 > 95
+          for: 3m
+          labels:
+            severity: warning
+            component: gpu-hardware
+          annotations:
+            summary: "GPU VRAM Memory Exhaustion (> 95%)"
+            description: "GPU VRAM usage on {{ $labels.node }} is at {{ $value }}%."
+
+      
+        - alert: GPUNodeUnavailable
+          expr: kube_node_status_condition{condition="Ready", status="true", node=~".*gpu.*"} == 0
+          for: 2m
+          labels:
+            severity: critical
+            component: gpu-node
+          annotations:
+            summary: "NVIDIA GPU Node Not Ready"
+            description: "GPU node {{ $labels.node }} is in NotReady condition."
+
+       
+        - alert: PodCrashLooping
+          expr: sum by (pod, namespace) (increase(kube_pod_container_status_restarts_total{namespace="mistral-gateway"}[10m])) > 3
+          for: 2m
+          labels:
+            severity: warning
+            component: kubernetes
+          annotations:
+            summary: "Pod {{ $labels.pod }} CrashLooping / Restarting Frequently"
+            description: "Pod {{ $labels.pod }} restarted {{ $value }} times in the last 10 minutes."
+
+       
+        - alert: ModelInferenceUnavailable
+          expr: (vllm:num_requests_waiting > 0) and (sum(rate(vllm:e2e_request_latency_seconds_count[3m])) == 0)
+          for: 2m
+          labels:
+            severity: critical
+            component: inference-engine
+          annotations:
+            summary: "Model Inference Requests Stalled"
+            description: "vLLM has queued waiting requests but zero completed requests in the last 3 minutes."

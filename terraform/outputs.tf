@@ -1,22 +1,4 @@
-# =============================================================================
-# terraform/outputs.tf
-#
-# WHY OUTPUTS?
-#   Outputs are the interface between Terraform and the outside world:
-#     • CI/CD pipelines: `terraform output -raw registry_hostname` to get the
-#       Artifact Registry URL for docker push in .github/workflows/ci.yaml
-#     • kubectl setup: `gcloud container clusters get-credentials $(terraform output -raw cluster_name)`
-#     • Kubernetes manifest patching: replace PROJECT_ID placeholders in k8s/ SAs
-#     • Cross-module references: if this module is used as a Terraform module by
-#       another config, outputs are how values are passed to the parent module
-#
-# SENSITIVE OUTPUTS:
-#   Marked sensitive = true to prevent values from appearing in:
-#     • `terraform plan` output
-#     • `terraform apply` terminal output
-#     • CI/CD logs
-#   They are still accessible via `terraform output -raw <name>` locally.
-# =============================================================================
+
 
 # ── Project ────────────────────────────────────────────────────────────────────
 
@@ -96,8 +78,7 @@ output "model_bucket_url" {
 }
 
 # ── Service Account Emails ─────────────────────────────────────────────────────
-# Use these to replace PROJECT_ID in the k8s/ ServiceAccount annotations:
-#   iam.gke.io/gcp-service-account: <email>
+
 
 output "gke_node_sa_email" {
   description = "Email of the GKE node service account. Used in node pool config."

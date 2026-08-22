@@ -1,31 +1,9 @@
-# =============================================================================
-# k8s/vllm/02-service.yaml
-#
-# WHY ClusterIP for vLLM?
-#   vLLM is an internal inference backend — it should NEVER be reachable
-#   from outside the cluster. From Diagram 1:
-#
-#     FastAPI Pods  →  vllm-service (ClusterIP:8001)  →  vLLM Pods
-#
-#   Traffic originates inside the cluster from FastAPI pods only.
-#   ClusterIP provides a stable internal virtual IP and DNS name:
-#     http://vllm-service.mistral-gateway.svc.cluster.local:8001
-#
-#   This DNS name is hardcoded in the FastAPI ConfigMap (01-configmap.yaml):
-#     VLLM_BASE_URL: "http://vllm-service.mistral-gateway.svc.cluster.local:8001"
-#
-#   THE SERVICE NAME (`vllm-service`) AND PORT (8001) ARE FIXED.
-#   Changing either without updating the FastAPI ConfigMap will break inference.
-#
-# COMMAND: kubectl apply -f k8s/vllm/02-service.yaml
-# VERIFY:  kubectl get endpoints vllm-service -n mistral-gateway
-#          (endpoints list should show pod IPs once pods are Ready)
-# =============================================================================
+
 
 apiVersion: v1
 kind: Service
 metadata:
-  # CRITICAL: This name must match VLLM_BASE_URL in k8s/fastapi/01-configmap.yaml
+  
   name: vllm-service
   namespace: mistral-gateway
 
@@ -35,56 +13,24 @@ metadata:
     app.kubernetes.io/part-of: mistral-gateway
 
   annotations:
-    # WHY NEG annotation?
-    #   Container-native load balancing routes directly to pod IPs.
-    #   For vLLM, this is especially important because:
-    #     • Inference requests are long-lived (up to 120 seconds)
-    #     • kube-proxy's iptables mode uses random pod selection — it may
-    #       send a request to a pod that is at capacity (GPU fully utilised)
-    #     • Container-native LB (NEG) enables health-check-aware routing —
-    #       only Ready pods receive traffic
-    #   Note: NEGs are created by the Ingress controller for external traffic.
-    #   For internal ClusterIP traffic (FastAPI → vLLM), kube-proxy handles
-    #   routing. This annotation is preparatory for Phase 5 (GKE mesh).
+    
     cloud.google.com/neg: '{"ingress": true}'
 
 spec:
   type: ClusterIP
 
-  # ── Selector ──────────────────────────────────────────────────────────────
-  # Must match Deployment.spec.template.metadata.labels.app
-  # Kubernetes updates the Endpoints object automatically as pods
-  # pass/fail readiness probes.
+  
   selector:
     app: vllm
 
-  # ── Ports ─────────────────────────────────────────────────────────────────
+  # ── Ports ──────────────────────
   ports:
     - name: http
 
-      # WHY port 8001?
-      #   We use 8001 (not 80) for the vLLM Service because:
-      #     • It distinguishes vLLM traffic from FastAPI traffic (port 80/8000)
-      #       in network logs and firewall rules
-      #     • The FastAPI ConfigMap hardcodes port 8001 in VLLM_BASE_URL
-      #     • Port 8001 matches the --port arg in the vLLM Deployment
-      #   The Service port and containerPort must match.
+     
       port: 8001
-      targetPort: http    # Named port `http` from the Deployment (containerPort: 8001)
+      targetPort: http    
       protocol: TCP
 
-  # ── Session affinity ───────────────────────────────────────────────────────
-  # WHY ClientIP session affinity for vLLM?
-  #   Unlike FastAPI (which is stateless and uses None), vLLM benefits from
-  #   sticky sessions in some scenarios:
-  #     • Multi-turn conversations: if the KV cache from turn 1 is on pod A,
-  #       routing turn 2 to pod A avoids recomputing the prefix attention
-  #       (prefix caching feature in vLLM >= 0.4.0)
-  #     • Consistent batching: repeated clients land on the same pod, improving
-  #       continuous batching efficiency
-  #
-  #   However, ClientIP affinity can cause uneven load distribution.
-  #   We set it to None here (round-robin) and rely on vLLM's own prefix cache
-  #   and request scheduling. Enable ClientIP affinity if benchmarking shows
-  #   significant cache hit rate improvement.
+  
   sessionAffinity: None

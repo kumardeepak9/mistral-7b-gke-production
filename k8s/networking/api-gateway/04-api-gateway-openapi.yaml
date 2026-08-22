@@ -1,75 +1,6 @@
-# =============================================================================
-# k8s/networking/04-api-gateway-openapi.yaml
-#
-# WHAT IS Google Cloud API Gateway?
-#   A fully managed GCP service that sits IN FRONT of the GKE Ingress.
-#   It provides API management capabilities that are outside the scope of
-#   Kubernetes Ingress or Cloud Armor:
-#
-#     • API key authentication (per-consumer identity)
-#     • Consumer-level rate limiting and quotas
-#     • OpenAPI contract enforcement (reject malformed requests before FastAPI)
-#     • API versioning (/v1 → FastAPI v1, /v2 → FastAPI v2 without cluster changes)
-#     • Usage analytics (which consumers call which endpoints, how often)
-#     • Developer portal integration (auto-generated API docs)
-#
-# HOW API GATEWAY FITS INTO THE ARCHITECTURE (Diagram 1):
-#
-#   Internet
-#     ↓ HTTPS: api.example.com (DNS points to API Gateway's managed domain)
-#   Google Cloud API Gateway
-#     ↓ x-google-backend: forwards to GKE Ingress external IP
-#   GCP HTTPS Load Balancer (GKE Ingress)
-#     ↓ Cloud Armor evaluates request
-#   FastAPI Service → FastAPI Pod → vLLM
-#
-#   The API Gateway provides a PUBLIC managed domain:
-#     https://mistral-gateway-HASH-uc.a.run.app
-#   But consumers use the custom domain (CNAME to API Gateway):
-#     api.example.com → mistral-gateway.apigateway.PROJECT_ID.cloud.goog
-#
-# THIS FILE IS NOT A KUBERNETES RESOURCE.
-#   It is an OpenAPI 2.0 specification consumed by gcloud, not kubectl.
-#   Deploy it with:
-#
-#   # 1. Enable the API Gateway service
-#   gcloud services enable apigateway.googleapis.com --project=PROJECT_ID
-#   gcloud services enable servicemanagement.googleapis.com --project=PROJECT_ID
-#   gcloud services enable servicecontrol.googleapis.com --project=PROJECT_ID
-#
-#   # 2. Create the API
-#   gcloud api-gateway apis create mistral-inference-api \
-#     --project=PROJECT_ID \
-#     --display-name="Mistral-7B Inference API"
-#
-#   # 3. Create the API config from this OpenAPI spec
-#   gcloud api-gateway api-configs create v1-config \
-#     --api=mistral-inference-api \
-#     --openapi-spec=k8s/networking/04-api-gateway-openapi.yaml \
-#     --project=PROJECT_ID \
-#     --backend-auth-service-account=api-gateway-sa@PROJECT_ID.iam.gserviceaccount.com
-#
-#   # 4. Deploy the gateway
-#   gcloud api-gateway gateways create mistral-gateway \
-#     --api=mistral-inference-api \
-#     --api-config=v1-config \
-#     --location=us-central1 \
-#     --project=PROJECT_ID
-#
-#   # 5. Create an API key for consumer access
-#   gcloud alpha services api-keys create \
-#     --display-name="Mistral API Key" \
-#     --api-target=service=mistral-inference-api.apigateway.PROJECT_ID.cloud.goog \
-#     --project=PROJECT_ID
-#
-# WHY API_KEY security over JWT?
-#   API keys are simpler for server-to-server access (no token refresh needed).
-#   JWT (Bearer tokens) is better for user-facing authentication (Phase 7: IAP).
-#   For this ML inference API, consumers are other services — API keys are correct.
-#
-# =============================================================================
 
-swagger: "2.0"    # Google Cloud API Gateway uses OpenAPI 2.0 (Swagger), not 3.0
+
+swagger: "2.0"    
 
 info:
   title: "Mistral-7B Inference API"
@@ -85,60 +16,30 @@ info:
     name: "Apache 2.0"
     url: "https://www.apache.org/licenses/LICENSE-2.0"
 
-# The base URL for all paths. Google Cloud API Gateway will use the HTTPS
-# managed endpoint — consumers call this domain.
-# Replace PROJECT_ID with your GCP project ID.
-host: "mistral-gateway.apigateway.PROJECT_ID.cloud.goog"
+
+host: "mistral-gateway.apigateway.project-d9f9eda6-2e99-4916-a87.cloud.goog"
 basePath: "/"
 schemes:
-  - https   # API Gateway always serves HTTPS — no HTTP option
+  - https   
 
-# ── Security definition ───────────────────────────────────────────────────────
-# WHY api_key security?
-#   API key authentication is the correct choice for service-to-service calls:
-#     • No expiry (unlike JWT access tokens that expire in 1 hour)
-#     • No refresh flow needed (simplifies client code)
-#     • Per-key rate limiting and quota enforcement at API Gateway level
-#     • Easy revocation: delete the key in GCP Console → instant effect
-#
-# HOW IT WORKS:
-#   Client sends: GET /v1/models  with header  x-api-key: AIzaSy...
-#   API Gateway validates the key against GCP API key service
-#   If valid → forward to GKE Ingress backend
-#   If invalid → 401 Unauthorized (never reaches FastAPI or the cluster)
+
 securityDefinitions:
   api_key:
     type: "apiKey"
-    name: "x-api-key"   # Header name clients must include
-    in: "header"        # Can also be "query" (x-api-key=... in URL) but header is safer
+    name: "x-api-key"   
+    in: "header"        
 
 # Apply API key requirement to ALL paths by default
 security:
   - api_key: []
 
-# ── Backend configuration ─────────────────────────────────────────────────────
-# WHY x-google-backend?
-#   This is a Google Cloud API Gateway extension that specifies where to forward
-#   requests after authentication and validation.
-#   address: the GKE Ingress external IP (or DNS name).
-#
-#   Replace INGRESS_EXTERNAL_IP with the IP from:
-#     kubectl get ingress mistral-ingress -n mistral-gateway -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
-#
-#   WHY protocol: h2?
-#     HTTP/2 (h2) multiplexes multiple requests over a single TCP connection.
-#     This is more efficient for long-running inference requests (stream responses).
-#     HTTP/1.1 requires a new connection per request — higher overhead.
+
 x-google-backend:
   address: "https://INGRESS_EXTERNAL_IP"
   protocol: h2
-  # WHY path_translation: APPEND_PATH_TO_ADDRESS?
-  #   APPEND: API Gateway request to /v1/chat/completions → backend /v1/chat/completions
-  #   CONSTANT: ALL requests → backend / (strips the path)
-  #   APPEND is correct — we want the full path to reach FastAPI unchanged.
+  
   path_translation: APPEND_PATH_TO_ADDRESS
-  # jwt_audience is not needed here since the backend uses its own auth (Cloud Armor + FastAPI)
-  # Add jwt_audience if implementing service-to-service JWT auth between API GW and GKE.
+  
 
 # ── API paths ─────────────────────────────────────────────────────────────────
 paths:
@@ -174,9 +75,7 @@ paths:
       description: "Returns 200 if the FastAPI application is running."
       tags:
         - monitoring
-      security: []    # WHY no security here? Health checks must be publicly reachable
-                      # for GCP Uptime Checks and the GCP Load Balancer health prober.
-                      # API key requirement would cause the LB health check to fail (401).
+      security: []    
       produces:
         - "application/json"
       responses:

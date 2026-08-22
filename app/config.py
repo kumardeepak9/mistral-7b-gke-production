@@ -13,7 +13,9 @@
 #        • Testability    — tests can override settings without patching os.environ
 # ─────────────────────────────────────────────────────────────────────────────
 
-from pydantic import Field, field_validator
+from typing import Literal
+
+from pydantic import AnyHttpUrl, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -39,7 +41,7 @@ class Settings(BaseSettings):
     )
 
     # ── Application ──────────────────────────────────────────────────────────
-    app_env: str = Field(
+    app_env: Literal["development", "staging", "production"] = Field(
         default="development",
         description="Runtime environment: development | staging | production",
     )
@@ -47,7 +49,7 @@ class Settings(BaseSettings):
         default="0.1.0",
         description="Semantic version injected by CI during Docker build",
     )
-    log_level: str = Field(
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
         default="INFO",
         description="Python logging level: DEBUG | INFO | WARNING | ERROR | CRITICAL",
     )
@@ -59,15 +61,18 @@ class Settings(BaseSettings):
     )
     port: int = Field(
         default=8000,
+        ge=1,
+        le=65535,
         description="Uvicorn listen port. Must match containerPort in GKE Deployment spec.",
     )
     workers: int = Field(
         default=1,
+        ge=1,
         description="Number of Uvicorn worker processes. Set >= 1 per CPU core in prod.",
     )
 
     # ── vLLM Backend ─────────────────────────────────────────────────────────
-    vllm_base_url: str = Field(
+    vllm_base_url: AnyHttpUrl = Field(
         default="http://vllm-service:8001",
         description="ClusterIP URL of the vLLM service inside the GKE cluster.",
     )
@@ -77,16 +82,19 @@ class Settings(BaseSettings):
     )
     vllm_timeout_seconds: int = Field(
         default=120,
+        ge=1,
         description="Max seconds to wait for vLLM to return a completion.",
     )
 
     # ── Request Limits ───────────────────────────────────────────────────────
     max_tokens_limit: int = Field(
         default=4096,
+        ge=1,
         description="Hard ceiling on max_tokens to prevent runaway inference costs.",
     )
     default_max_tokens: int = Field(
         default=512,
+        ge=1,
         description="Default max_tokens when the caller does not supply one.",
     )
 
@@ -100,14 +108,13 @@ class Settings(BaseSettings):
             raise ValueError(f"log_level must be one of {allowed}, got '{v}'")
         return upper
 
-    @field_validator("app_env")
-    @classmethod
-    def validate_app_env(cls, v: str) -> str:
-        allowed = {"development", "staging", "production"}
-        lower = v.lower()
-        if lower not in allowed:
-            raise ValueError(f"app_env must be one of {allowed}, got '{v}'")
-        return lower
+    @model_validator(mode="after")
+    def validate_token_defaults(self) -> "Settings":
+        if self.default_max_tokens > self.max_tokens_limit:
+            raise ValueError(
+                "default_max_tokens must be less than or equal to max_tokens_limit"
+            )
+        return self
 
     # ── Derived properties ───────────────────────────────────────────────────
     @property

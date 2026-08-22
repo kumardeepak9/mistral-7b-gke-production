@@ -1,42 +1,11 @@
-# =============================================================================
-# k8s/model-provisioning/03-persistentvolumeclaim.yaml
-#
-# WHY PersistentVolumeClaim (PVC)?
-#   Pods cannot reference PersistentVolumes directly. They always go through
-#   a PVC. The PVC:
-#     1. Declares storage requirements (size, access mode)
-#     2. Binds to a matching PV (manually pre-bound here via claimRef)
-#     3. Provides a stable name (`model-pvc`) that the vLLM Deployment references
-#
-# THE NAME `model-pvc` IS A FIXED CONTRACT:
-#   k8s/vllm/01-deployment.yaml references this PVC by name:
-#     volumes:
-#       - name: model-storage
-#         persistentVolumeClaim:
-#           claimName: model-pvc
-#   Renaming this PVC without updating the vLLM Deployment will cause:
-#     Warning  FailedMount  Unable to attach or mount volumes:
-#              "model-pvc" not found
-#   The vLLM pod will remain in Pending state indefinitely.
-#
-# BINDING LIFECYCLE:
-#   1. Apply 02-persistentvolume.yaml  → PV created, Status: Available
-#   2. Apply this file                 → PVC created, Status: Pending
-#   3. K8s controller matches PVC to PV via claimRef → both Status: Bound
-#   4. vLLM Deployment pods can now mount the PVC
-#
-# COMMAND: kubectl apply -f k8s/model-provisioning/03-persistentvolumeclaim.yaml
-# VERIFY:  kubectl get pvc model-pvc -n mistral-gateway
-#          (STATUS should be Bound within a few seconds)
-# =============================================================================
+
 
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  # CRITICAL: This name is hardcoded in k8s/vllm/01-deployment.yaml.
-  # Do not change without updating the vLLM Deployment volume reference.
+  
   name: model-pvc
-  namespace: mistral-gateway    # Must match vLLM Deployment namespace
+  namespace: mistral-gateway   
 
   labels:
     app.kubernetes.io/name: model-provisioning
@@ -45,46 +14,21 @@ metadata:
     model: mistral-7b-instruct-v0.3
 
   annotations:
-    # Documents which PV this PVC is designed to bind to.
-    # This annotation is informational — the actual binding is controlled
-    # by the PV's claimRef and the storageClassName match.
+    
     volume.kubernetes.io/selected-node: "bound-to-model-gcs-pv"
 
 spec:
-  # ── Access mode ─────────────────────────────────────────────────────────────
-  # WHY ReadOnlyMany?
-  #   Must match the PV's accessModes. Kubernetes will only bind a PVC to a PV
-  #   if their access modes are compatible.
-  #
-  #   ReadOnlyMany allows all vLLM pods (across multiple nodes) to mount this
-  #   PVC simultaneously in read-only mode. This is the correct mode because:
-  #     • Mistral-7B weights do not change at runtime
-  #     • Multiple vLLM replicas need to read the same files concurrently
-  #     • GCS natively supports concurrent reads from any number of clients
+  
   accessModes:
     - ReadOnlyMany
 
-  # ── Storage request ─────────────────────────────────────────────────────────
-  # WHY 50Gi?
-  #   Must match the PV's capacity (50Gi in 02-persistentvolume.yaml).
-  #   For GCS Fuse, this is informational — GCS has no enforced storage limit.
-  #   Kubernetes uses this to match PVCs to PVs — they must be equal.
+  
   resources:
     requests:
       storage: 50Gi
 
-  # ── Storage class ────────────────────────────────────────────────────────────
-  # WHY empty string?
-  #   Must match the PV's storageClassName: "".
-  #   Empty string means "statically provisioned" — don't use a dynamic provisioner.
-  #   This ensures the PVC binds to our manually created PV (model-gcs-pv),
-  #   not to some automatically provisioned volume.
+ 
   storageClassName: ""
 
-  # ── Volume name ──────────────────────────────────────────────────────────────
-  # WHY volumeName?
-  #   Directly references the PV by name, bypassing the normal selector matching.
-  #   This is the PVC-side complement to the PV's claimRef.
-  #   Together, claimRef (PV → PVC) and volumeName (PVC → PV) create a
-  #   mutual pre-binding that prevents any mis-binding.
-  volumeName: model-gcs-pv     # Must match metadata.name in 02-persistentvolume.yaml
+ 
+  volumeName: model-gcs-pv     

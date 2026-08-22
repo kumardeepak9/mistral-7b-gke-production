@@ -138,12 +138,12 @@ on:
 #   Jobs inherit these via `env` context.
 env:
   GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-  REGION: us-central1
-  ARTIFACT_REGISTRY_HOST: us-central1-docker.pkg.dev
-  REPOSITORY: mistral-repo
-  IMAGE_NAME: mistral-inference-gateway
   GKE_CLUSTER_NAME: ${{ secrets.GKE_CLUSTER_NAME }}
   GKE_CLUSTER_REGION: ${{ secrets.GKE_CLUSTER_REGION }}
+  REGION: ${{ secrets.GKE_CLUSTER_REGION }}
+  ARTIFACT_REGISTRY_HOST: ${{ secrets.GKE_CLUSTER_REGION }}-docker.pkg.dev
+  REPOSITORY: mistral-registry
+  IMAGE_NAME: mistral-inference-gateway
   NAMESPACE: mistral-gateway
   DEPLOYMENT_NAME: fastapi
   CONTAINER_NAME: fastapi   # Container name in k8s/fastapi/04-deployment.yaml
@@ -225,7 +225,15 @@ jobs:
           #   Without this, Docker authentication fails.
           token_format: access_token
 
-      # ── Step 2: Configure Docker to authenticate with Artifact Registry ──────
+      # ── Step 2: Validate the registry target before building ───────────────
+      - name: Verify Artifact Registry repository exists
+        run: |
+          gcloud artifacts repositories describe "${{ env.REPOSITORY }}" \
+            --project="${{ env.GCP_PROJECT_ID }}" \
+            --location="${{ env.GKE_CLUSTER_REGION }}" \
+            --format='value(name)'
+
+      # ── Step 3: Configure Docker to authenticate with Artifact Registry ──────
       - name: Login to Artifact Registry
         uses: docker/login-action@v3
         with:
@@ -233,7 +241,7 @@ jobs:
           username: oauth2accesstoken
           password: ${{ steps.auth.outputs.access_token }}
 
-      # ── Step 3: Set up Docker Buildx ─────────────────────────────────────────
+      # ── Step 4: Set up Docker Buildx ─────────────────────────────────────────
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
@@ -244,7 +252,7 @@ jobs:
           driver-opts: |
             network=host
 
-      # ── Step 4: Generate the image tag ────────────────────────────────────────
+      # ── Step 5: Generate the image tag ────────────────────────────────────────
       - name: Generate image tag (commit SHA)
         id: tag
         run: |

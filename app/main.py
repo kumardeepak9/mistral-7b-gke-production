@@ -27,6 +27,8 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from prometheus_fastapi_instrumentator import Instrumentator
+
 from app.config import settings
 from app.core import add_exception_handlers
 from app.logging_config import setup_logging
@@ -162,6 +164,20 @@ def create_application() -> FastAPI:
             status="running",
             docs="/docs",
         )
+
+    # ── Prometheus Metrics Instrumentation ────────────────────────────────
+    # Exposes standard HTTP metrics at /metrics for Prometheus scraping
+    Instrumentator(
+        should_group_status_codes=False,
+        should_ignore_untemplated=True,
+        should_respect_env_var=False,
+        excluded_handlers=["/metrics", "/health", "/ready"],
+    ).instrument(application).expose(
+        application,
+        endpoint="/metrics",
+        include_in_schema=True,
+        tags=["monitoring"],
+    )
 
     logger.info(
         "FastAPI application created",

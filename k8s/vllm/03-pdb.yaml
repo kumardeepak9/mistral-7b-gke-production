@@ -1,43 +1,4 @@
-# =============================================================================
-# k8s/vllm/03-pdb.yaml — PodDisruptionBudget
-#
-# WHY PodDisruptionBudget (PDB) for vLLM?
-#   GPU nodes require periodic maintenance: OS patches, NVIDIA driver updates,
-#   GKE node pool upgrades. Kubernetes drains a node before maintenance by
-#   evicting its pods. Without a PDB:
-#
-#     SCENARIO (2 replicas, no PDB):
-#       GKE drains node-1 (vllm-pod-A)   → evicted immediately
-#       GKE drains node-2 (vllm-pod-B)   → evicted immediately
-#       Result: ZERO vLLM pods running for 8–15 minutes (model reload time)
-#               FastAPI returns 502 Bad Gateway to all users
-#
-#     SCENARIO (2 replicas, with PDB minAvailable: 1):
-#       GKE drains node-1 (vllm-pod-A)   → PDB blocks eviction of vllm-pod-B
-#       GKE evicts vllm-pod-A             → new pod starts on available node
-#       New pod loads model (~10 min)     → becomes Ready
-#       PDB now allows eviction of old pod → zero-gap maintenance
-#       Result: At least 1 vLLM pod always serving requests
-#
-# WHY minAvailable: 1 (not maxUnavailable: 1)?
-#   With 2 replicas:
-#     minAvailable: 1 = at least 1 pod must be Running and Ready
-#     maxUnavailable: 1 = at most 1 pod can be down
-#   These are mathematically equivalent for 2 replicas.
-#   We use minAvailable because it is more explicit about the guarantee:
-#   "I require at least 1 serving pod at all times."
-#   If replicas changes to 3, minAvailable: 1 still means "always 1 up"
-#   without needing to recalculate.
-#
-# IMPORTANT: The PDB does NOT protect against:
-#   • Node failure (hardware crash) — that is handled by the Deployment
-#   • OOMKill — handled by resource limits
-#   • Application crashes — handled by livenessProbe restart
-#   PDB ONLY protects against voluntary disruptions (drain, eviction).
-#
-# COMMAND: kubectl apply -f k8s/vllm/03-pdb.yaml
-# VERIFY:  kubectl get pdb -n mistral-gateway
-# =============================================================================
+
 
 apiVersion: policy/v1      # PDB moved from policy/v1beta1 to policy/v1 in K8s 1.21+
 kind: PodDisruptionBudget
@@ -51,16 +12,10 @@ metadata:
     app.kubernetes.io/part-of: mistral-gateway
 
 spec:
-  # ── Disruption budget ──────────────────────────────────────────────────────
-  # WHY minAvailable: 1 (not a percentage)?
-  #   With small replica counts (2–3), percentages round down unpredictably.
-  #   minAvailable: "50%" with 2 replicas = 1 pod (rounds down from 1.0 = 1).
-  #   Using an absolute number is unambiguous and interview-friendly to explain.
+  
   minAvailable: 1
 
-  # ── Selector ──────────────────────────────────────────────────────────────
-  # Must match the vLLM pod labels defined in the Deployment.
-  # The PDB applies to any pod with `app: vllm` in this namespace.
+  
   selector:
     matchLabels:
       app: vllm

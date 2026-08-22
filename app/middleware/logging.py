@@ -22,6 +22,7 @@ import uuid
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
 from starlette.responses import Response
+from starlette.status import HTTP_500_INTERNAL_SERVER_ERROR
 
 logger = logging.getLogger(__name__)
 
@@ -62,13 +63,31 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 
         # ── Skip health probes ────────────────────────────────────────────────
         if request.url.path in self._SKIP_PATHS:
-            return await call_next(request)
+            response = await call_next(request)
+            response.headers["X-Request-ID"] = request_id
+            return response
 
         # ── Timing ───────────────────────────────────────────────────────────
         start_time = time.perf_counter()
 
         # ── Execute request ───────────────────────────────────────────────────
-        response: Response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception:
+            duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+            logger.exception(
+                "request failed with unhandled exception",
+                extra={
+                    "request_id": request_id,
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status_code": HTTP_500_INTERNAL_SERVER_ERROR,
+                    "duration_ms": duration_ms,
+                    "client_ip": client_ip,
+                    "user_agent": request.headers.get("User-Agent", ""),
+                },
+            )
+            raise
 
         duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
 

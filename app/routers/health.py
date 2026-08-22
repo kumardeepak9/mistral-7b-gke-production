@@ -21,11 +21,12 @@
 
 import logging
 import time
+from typing import Literal
 
 from fastapi import APIRouter
-from pydantic import BaseModel
 
 from app.config import settings
+from app.schemas import HealthResponse, ReadinessResponse
 
 logger = logging.getLogger(__name__)
 
@@ -33,24 +34,6 @@ router = APIRouter(tags=["observability"])
 
 # Record the process start time once at module import
 _START_TIME = time.time()
-
-
-# ── Response models ───────────────────────────────────────────────────────────
-class HealthResponse(BaseModel):
-    """Response schema for /health (liveness probe)."""
-
-    status: str
-    version: str
-    environment: str
-    uptime_seconds: float
-
-
-class ReadinessResponse(BaseModel):
-    """Response schema for /ready (readiness probe)."""
-
-    status: str
-    version: str
-    checks: dict[str, str]
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -116,18 +99,10 @@ async def ready() -> ReadinessResponse:
           periodSeconds: 10
           failureThreshold: 3
     """
-    checks: dict[str, str] = {}
+    checks: dict[str, Literal["ok"]] = {}
 
-    # ── Check: configuration loaded ───────────────────────────────────────
-    try:
-        _ = settings.app_version  # access any field to confirm Settings is valid
-        checks["config_loaded"] = "ok"
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Config check failed", extra={"error": str(exc)})
-        checks["config_loaded"] = "error"
-
-    # ── Aggregate status ──────────────────────────────────────────────────
-    overall = "ok" if all(v == "ok" for v in checks.values()) else "degraded"
+    checks["config_loaded"] = "ok"
+    overall = "ok"
 
     logger.debug("Readiness probe hit", extra={"status": overall, "checks": checks})
 

@@ -1,24 +1,4 @@
-# =============================================================================
-# k8s/networking/01-frontend-config.yaml
-#
-# WHAT IS FrontendConfig?
-#   A GKE-specific CRD that configures the FRONTEND of the GCP HTTPS Load Balancer
-#   (the part that faces the internet). It controls:
-#     • HTTP → HTTPS redirect (prevents clients from accidentally using plaintext)
-#     • SSL/TLS policy (controls which TLS versions and cipher suites are allowed)
-#
-# FRONTEND vs BACKEND:
-#   FrontendConfig = what happens when a request ARRIVES at the load balancer
-#                    (SSL termination, HTTP redirect, TLS version enforcement)
-#   BackendConfig  = what happens when the load balancer FORWARDS to pods
-#                    (Cloud Armor WAF, timeout, health check, logging)
-#
-# HOW IT CONNECTS:
-#   The Ingress references this via annotation:
-#     networking.gke.io/v1beta1.FrontendConfig: "fastapi-frontend-config"
-#
-# COMMAND: kubectl apply -f k8s/networking/01-frontend-config.yaml
-# =============================================================================
+
 
 apiVersion: networking.gke.io/v1beta1   # Still in v1beta1 as of GKE 1.29
 kind: FrontendConfig
@@ -32,42 +12,10 @@ metadata:
     app.kubernetes.io/part-of: mistral-gateway
 
 spec:
-  # ── HTTP to HTTPS redirect ───────────────────────────────────────────────────
-  # WHY httpsRedirect?
-  #   Without this, a client that sends HTTP (port 80) gets an HTTP response —
-  #   their API key and request body travel in plaintext over the internet.
-  #   httpsRedirect: true makes the load balancer return 301 to any HTTP request,
-  #   forcing all traffic over HTTPS before it reaches Cloud Armor or FastAPI.
-  #
-  # WHY responseCodeName: MOVED_PERMANENTLY_DEFAULT?
-  #   301 (MOVED_PERMANENTLY_DEFAULT) causes browsers and HTTP clients to
-  #   cache the redirect and directly use HTTPS on future requests.
-  #   Use FOUND (302) if you want temporary redirects (no browser caching).
-  #   For an API, 301 is correct — API clients should update their base URL.
-  httpsRedirect:
+ 
+  redirectToHttps:
     enabled: true
     responseCodeName: MOVED_PERMANENTLY_DEFAULT
 
-  # ── SSL/TLS policy ────────────────────────────────────────────────────────────
-  # WHY sslPolicy?
-  #   By default, GCP load balancers accept TLS 1.0 and 1.1 — versions with
-  #   known vulnerabilities (POODLE, BEAST, CRIME). An SSL policy restricts
-  #   which TLS versions and cipher suites the LB will accept.
-  #
-  # The SSL policy referenced here must be created via gcloud BEFORE applying Ingress:
-  #
-  #   gcloud compute ssl-policies create modern-ssl-policy \
-  #     --profile MODERN \
-  #     --min-tls-version 1.2 \
-  #     --global
-  #
-  # WHY MODERN profile?
-  #   MODERN: TLS 1.2+ with strong ciphers (ECDHE, AES-GCM, CHACHA20-POLY1305)
-  #   RESTRICTED: TLS 1.2+ with only FIPS-approved ciphers (stricter, for compliance)
-  #   COMPATIBLE: TLS 1.0+ (weakest, for legacy clients) — never use in production
-  #
-  #   MODERN is the right choice for an ML inference API — modern Python clients
-  #   (httpx, requests) all support TLS 1.2+.
-  #
-  # Replace PROJECT_ID and REGION with your values.
-  sslPolicy: projects/PROJECT_ID/global/sslPolicies/modern-ssl-policy
+  
+  sslPolicy: projects/project-d9f9eda6-2e99-4916-a87/global/sslPolicies/modern-ssl-policy

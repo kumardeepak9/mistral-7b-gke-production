@@ -1,0 +1,14 @@
+.gcloudignore
+.git
+.gitignore
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+terraform/
+k8s/
+.DS_Store
+.env

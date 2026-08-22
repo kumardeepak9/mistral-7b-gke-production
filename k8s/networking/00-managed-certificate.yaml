@@ -47,12 +47,5 @@ metadata:
 
 spec:
   domains:
-    # WHY a single domain?
-    #   Each domain in the list requires a separate DNS validation probe.
-    #   Start with one domain — add subdomains (e.g., api-v2.example.com)
-    #   later without downtime (Google issues a SAN certificate).
-    #
-    # REPLACE api.example.com with your actual domain BEFORE applying.
-    # The domain must have a DNS A record pointing to the reserved static IP:
-    #   gcloud compute addresses describe mistral-gateway-ip --global
+  
     - api.example.com

@@ -1,53 +1,23 @@
-# =============================================================================
-# k8s/fastapi/00-namespace.yaml
-#
-# WHY a dedicated namespace?
-#   • Isolation — all FastAPI and vLLM resources live in one logical boundary.
-#     `kubectl get all -n mistral-gateway` shows the complete system.
-#   • RBAC scope — Role and RoleBinding objects are namespace-scoped.
-#     A service account in this namespace cannot access other namespaces.
-#   • Network Policy scope — policies that allow FastAPI → vLLM traffic are
-#     scoped to this namespace (Phase 5).
-#   • Resource Quotas — you can cap total CPU/memory for this namespace
-#     independently of other workloads on the cluster.
-#   • Cost attribution — GCP billing labels on the namespace allow per-team
-#     cost breakdown in Cloud Billing.
-#
-# APPLY ORDER: This MUST be the first file applied. All other manifests
-# reference `namespace: mistral-gateway`. Applying them without the namespace
-# existing causes an immediate "namespace not found" error.
-#
-# COMMAND: kubectl apply -f k8s/fastapi/00-namespace.yaml
-# =============================================================================
-
-apiVersion: v1          # Core Kubernetes API group — Namespace is a core resource
-kind: Namespace         # Object type
+apiVersion: v1          
+kind: Namespace        
 metadata:
-  name: mistral-gateway # The namespace name referenced by all other manifests
+  name: mistral-gateway 
 
   labels:
-    # WHY labels on a namespace?
-    # Labels enable namespace selectors in NetworkPolicy, PodSecurityAdmission,
-    # and monitoring tools (Prometheus namespace discovery).
 
-    # Standard Kubernetes recommended label — identifies the app family
+    # Standard Kubernetes recommended label
     app.kubernetes.io/name: mistral-gateway
 
     # Enforces Pod Security Standards at the namespace level.
-    # "baseline" blocks: privileged containers, hostPath mounts, host networking.
-    # "restricted" (stricter) would also block root containers — we use
-    # securityContext in the Deployment instead for finer control.
-    # Reference: https://kubernetes.io/docs/concepts/security/pod-security-standards/
     pod-security.kubernetes.io/enforce: baseline
     pod-security.kubernetes.io/enforce-version: latest
 
-    # Audit and warn modes catch violations without blocking pods (useful during
-    # migration to stricter policies).
+    # Audit and warn modes
     pod-security.kubernetes.io/audit: restricted
     pod-security.kubernetes.io/audit-version: latest
     pod-security.kubernetes.io/warn: restricted
     pod-security.kubernetes.io/warn-version: latest
 
-    # GCP cost attribution label — visible in Cloud Billing breakdown reports
+    # GCP cost attribution label
     environment: production
     team: ml-platform

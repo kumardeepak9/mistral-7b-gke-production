@@ -1,22 +1,4 @@
-# =============================================================================
-# terraform/variables.tf
-#
-# WHY VARIABLES?
-#   Hard-coding project IDs, regions, and names in resource files makes Terraform
-#   non-reusable. Variables decouple configuration from code:
-#     • Same .tf files deploy to dev, staging, production by changing tfvars
-#     • No sensitive data in source control (project IDs stay in CI secrets)
-#     • Documentation via `description` — `terraform-docs` auto-generates README
-#
-# SUPPLYING VALUES (in priority order — highest wins):
-#   1. -var flag:           terraform apply -var="project_id=my-project"
-#   2. terraform.tfvars:   file (gitignored — for local dev)
-#   3. TF_VAR_ env var:     TF_VAR_project_id=my-project terraform apply
-#   4. default:             used if no other value provided
-#
-# REQUIRED VARIABLES (no default — Terraform will prompt or error):
-#   • project_id  — must be supplied; no sensible default possible
-# =============================================================================
+
 
 # ── Project ───────────────────────────────────────────────────────────────────
 
@@ -37,11 +19,11 @@ variable "project_id" {
 variable "region" {
   description = <<-EOT
     GCP region for all regional resources (GKE cluster, Artifact Registry, GCS bucket).
-    NVIDIA L4 GPUs are available in: us-central1, us-east4, europe-west4, asia-east1.
+    NVIDIA L4 GPUs are available in: europe-west4, europe-west1, europe-west2, us-central1, us-east4, asia-east1.
     Choose the region closest to your users.
   EOT
   type        = string
-  default     = "us-central1"
+  default     = "europe-west4"
 }
 
 # ── Naming ────────────────────────────────────────────────────────────────────
@@ -244,7 +226,7 @@ variable "model_bucket_location" {
     Single-region (e.g. "US-CENTRAL1") is cheaper than multi-region ("US").
   EOT
   type        = string
-  default     = "US-CENTRAL1"
+  default     = "EUROPE-WEST4"
 }
 
 variable "model_bucket_storage_class" {

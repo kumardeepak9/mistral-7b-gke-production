@@ -1,16 +1,7 @@
-# =============================================================================
-# terraform/terraform.tfvars.example
-#
-# HOW TO USE:
-#   cp terraform.tfvars.example terraform.tfvars
-#   # Edit terraform.tfvars with your actual values
-#   # terraform.tfvars is gitignored — never commit it
-#
-# REQUIRED: project_id must be set. All others have sensible defaults.
-# =============================================================================
 
-# ── REQUIRED ──────────────────────────────────────────────────────────────────
-project_id = "your-gcp-project-id"   # Replace with your actual project ID
+
+# ── Project_ID ──────────────────────────────────────────────────────────────────
+project_id = "project-d9f9eda6-2e99-4916-a87"   
 
 # ── OPTIONAL (defaults shown) ─────────────────────────────────────────────────
 region      = "us-central1"
@@ -40,7 +31,7 @@ gpu_node_max_count     = 3
 gpu_node_initial_count = 1
 
 # ── Cost Savings (dev/staging only) ──────────────────────────────────────────
-# Set one of these to true to use cheaper GPU nodes in non-production:
+
 gpu_node_preemptible = false   # Legacy preemptible VMs (24h max, 30s eviction)
 gpu_node_spot        = false   # Spot VMs (no 24h limit, still 30s eviction)
 
