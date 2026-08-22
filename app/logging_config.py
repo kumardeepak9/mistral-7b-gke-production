@@ -1,18 +1,4 @@
-# ─────────────────────────────────────────────────────────────────────────────
-# app/logging_config.py
-#
-# WHY: In production, logs are consumed by Google Cloud Logging (from your
-#      Diagram 3 — Prometheus / Grafana stack). Cloud Logging expects structured
-#      JSON on stdout/stderr, not human-readable text. This module configures
-#      Python's logging to emit one JSON object per line, which:
-#
-#        • Makes logs queryable with filters (e.g., severity="ERROR")
-#        • Preserves context fields (request_id, pod_name, env) automatically
-#        • Enables Grafana dashboards to parse and aggregate log data
-#        • Replaces print() — all app code uses logging.getLogger(__name__)
-#
-#      The setup is called once at application startup (from main.py lifespan).
-# ─────────────────────────────────────────────────────────────────────────────
+
 
 import logging
 import sys

@@ -7,7 +7,7 @@
 [![Terraform](https://img.shields.io/badge/IaC-Terraform-7B42BC?logo=terraform&logoColor=white)](https://www.terraform.io)
 [![GCP](https://img.shields.io/badge/Cloud-Google%20Cloud-4285F4?logo=google-cloud&logoColor=white)](https://cloud.google.com)
 
-An enterprise ready, highly available, and secure infrastructure deployment for serving **Mistral-7B-Instruct-v0.3** large language models at scale. Built with **Terraform**, **GKE (NVIDIA GPU Node Pools)**, **vLLM (PagedAttention)**, **FastAPI Gateway (OpenAI-compatible)**, **GCS FUSE CSI**, **Cloud Armor**, **Google-managed HTTPS Load Balancing**, **Prometheus/Grafana observability**, and automated **GitHub Actions CI/CD with Workload Identity Federation (WIF)**.
+An enterprise ready, highly available, and secure infrastructure deployment for serving **Mistral-7B-Instruct-v0.3** large language models at scale. Built with **Terraform**, **GKE (NVIDIA GPU Node Pools)**, **vLLM (PagedAttention)**, **FastAPI Gateway (OpenAI-compatible)**, **GCS FUSE CSI**, **Cloud Armor**, **Google-managed HTTPS Load Balancing**, **Prometheus/Grafana observability**, and automated **GitHub Actions CI/CD with Workload Identity Federation**.
 
 ---
 
@@ -22,10 +22,10 @@ The system is designed with a defense in depth, decoupled microservices pattern 
 
 ## 2. Key Features
 
-- **High-Throughput LLM Serving**: Powered by **vLLM** leveraging PagedAttention, continuous batching, and dynamic KV cache allocation for low-latency token generation.
-- **OpenAI-Compatible FastAPI Gateway**: Async, high-concurrency API exposing standard `/v1/chat/completions` (with streaming Server-Sent Events), health endpoints (`/health`, `/ready`), and auto-generated OpenAPI/Swagger documentation (`/docs`).
-- **GCS FUSE CSI Storage Integration**: Direct POSIX-compliant mounting of model weights from Google Cloud Storage into GPU pods, eliminating slow init-container downloads and multi-gigabyte disk duplication.
-- **Enterprise Edge Security**: Google Cloud Armor WAF integration for DDoS mitigation, rate limiting, and geo-filtering, combined with Google-managed SSL certificates and optional Identity-Aware Proxy (IAP).
+- **High-Throughput LLM Serving**: Powered by **vLLM** leveraging PagedAttention, continuous batching, and dynamic KV cache allocation for low latency token generation.
+- **OpenAI-Compatible FastAPI Gateway**: Async, high-concurrency API exposing standard `/v1/chat/completions` (with streaming Server Sent Events), health endpoints (`/health`, `/ready`), and auto generated OpenAPI/Swagger documentation (`/docs`).
+- **GCS FUSE CSI Storage Integration**: Direct POSIX compliant mounting of model weights from Google Cloud Storage into GPU pods, eliminating slow init container downloads and multi gigabyte disk duplication.
+- **Enterprise Edge Security**: Google Cloud Armor WAF integration for DDoS mitigation, rate limiting, and geo filtering, combined with Google managed SSL certificates and optional Identity Aware Proxy (IAP).
 - **GPU-Aware Scheduling & Resilience**: Dedicated GKE GPU node pools configured with taints, tolerations, node affinity, `nvidia.com/gpu` resource limits, and PodDisruptionBudgets (PDB) to prevent cold restarts.
 - **End-to-End Infrastructure as Code (IaC)**: Fully parameterized Terraform modules managing VPC networking, Private GKE clusters, GPU node pools, IAM Workload Identity, Artifact Registry, and Cloud Storage buckets.
 - **Zero-Key CI/CD Pipelines**: GitHub Actions leveraging GCP Workload Identity Federation (WIF) via OIDC for keyless authentication, automated container builds, vulnerability scans, and canary/rolling deployments.
@@ -63,14 +63,14 @@ Instead of baking a ~15GB model into a container image or downloading weights on
              │ 1. One-time Sync via K8s Job / gsutil
              ▼
 ┌─────────────────────────┐
-│ Google Cloud Storage    │  Bucket: gs://<PROJECT_ID>-mistral-models
+│ Google Cloud Storage    │  Bucket: gs://<YOUR_PROJECT_ID>-mistral-models
 │ (Model Bucket)          │  Path:   /mistral-7b-instruct-v0.3/
 └────────────┬────────────┘
              │
              │ 2. Mounted into Pod filesystem at runtime
              ▼
 ┌─────────────────────────┐
-│ GCS FUSE CSI Driver     │  Annotation: gke-gcsfuse/volumes: "true"
+│ GCS FUSE CSI Driver     │  Annotation: gke-gcsfuse/volumes
 │ (In-Kernel Virtual FS)  │  MountPath:  /mnt/models
 └────────────┬────────────┘
              │
@@ -78,13 +78,13 @@ Instead of baking a ~15GB model into a container image or downloading weights on
              ▼
 ┌─────────────────────────┐
 │ vLLM Inference Engine   │  vllm serve /mnt/models/mistral-7b-instruct-v0.3
-│ (NVIDIA GPU Pod)        │  --gpu-memory-utilization 0.90 --max-model-len 8192
+│ (NVIDIA GPU Pod)        │  
 └─────────────────────────┘
 ```
 
 1. **One-Time Ingestion**: A Kubernetes Provisioning Job (`k8s/model-provisioning/04-job.yaml`) authenticates to Hugging Face using a secret token and synchronizes model weights directly to GCS.
 2. **GCS FUSE Mounting**: GKE's native `gcsfuse` CSI driver mounts the model bucket directly as a POSIX filesystem within the vLLM pod.
-3. **Sub-Minute Pod Startup**: vLLM reads directly from the stream-backed mount, drastically reducing pod initialization latency.
+3. **Sub-Minute Pod Startup**: vLLM reads directly from the stream backed mount, drastically reducing pod initialization latency.
 
 ---
 
@@ -97,7 +97,7 @@ The Kubernetes layer is decoupled into specialized workloads:
 | **Namespace & RBAC** | `k8s/fastapi/00-namespace.yaml` | Scoped namespace `mistral-serving` | N/A |
 | **FastAPI Gateway** | `k8s/fastapi/04-deployment.yaml` | Replicas: 3+, HPA on CPU/RPS, PDB (minAvailable: 1) | `node-pool-cpu` (e2-standard-4) |
 | **vLLM GPU Server** | `k8s/vllm/01-deployment.yaml` | Replicas: 1-2, PDB (maxUnavailable: 0) | `node-pool-gpu` (`nvidia.com/gpu: 1`, `g2-standard-8` / `a2-highgpu-1g`) |
-| **Model Ingestion** | `k8s/model-provisioning/04-job.yaml` | One-shot Batch Job with Workload Identity | `node-pool-cpu` |
+| **Model Ingestion** | `k8s/model-provisioning/04-job.yaml` | One shot Batch Job with Workload Identity | `node-pool-cpu` |
 | **Cloud Networking** | `k8s/networking/03-ingress.yaml` | Global HTTPS Ingress + ManagedCert + BackendConfig | GKE L7 Ingress Controller |
 | **DCGM Exporter** | `k8s/monitoring/01-dcgm-exporter.yaml` | DaemonSet on GPU nodes | `node-pool-gpu` (tolerates GPU taints) |
 
@@ -111,12 +111,12 @@ The Kubernetes layer is decoupled into specialized workloads:
   - Geographic blocking and CIDR IP allowlisting.
   - OWASP Top 10 mitigation rules (SQLi, XSS, RCE protection).
 - **Least Privilege Principle**:
-  - GKE nodes run with minimal default scopes; granular permissions are granted to workload-specific Google Service Accounts.
+  - GKE nodes run with minimal default scopes; granular permissions are granted to workload specific Google Service Accounts.
   - Containers run as non-root with read-only root filesystems where applicable.
 - **Encrypted In-Transit & At-Rest**:
   - TLS 1.3 termination at the Google Global Load Balancer with automated certificate lifecycle management via `ManagedCertificate`.
   - Node-to-node internal network encryption with Google VPC native alias IP routing.
-  - GCS Customer-Managed Encryption Keys (CMEK) or Google-managed encryption for model storage.
+  - GCS Customer Managed Encryption Keys (CMEK) or Google managed encryption for model storage.
 
 ---
 
@@ -133,7 +133,7 @@ The project employs a fully automated GitHub Actions pipeline located in `.githu
              ▼                           ▼
   ┌──────────────────────┐    ┌──────────────────────┐
   │   CI: Code Quality   │    │  CI: Docker Linting  │
-  │ • Black / Flake8 / Isort│ │ • Hadolint           │
+  │ • Black / Flake8     │    │ • Hadolint           │
   │ • Pytest Unit Tests  │    │ • Security Scan      │
   └──────────┬───────────┘    └──────────┬───────────┘
              └─────────────┬─────────────┘
@@ -144,7 +144,7 @@ The project employs a fully automated GitHub Actions pipeline located in `.githu
   └────────────────────────┬─────────────────────────────┘
                            ▼
   ┌──────────────────────────────────────────────────────┐
-  │  Docker Multi-Stage Build & Push to Artifact Registry │
+  │  Docker Multi-Stage Build & Push to Artifact Registry│
   └────────────────────────┬─────────────────────────────┘
                            ▼
   ┌──────────────────────────────────────────────────────┐
@@ -155,12 +155,12 @@ The project employs a fully automated GitHub Actions pipeline located in `.githu
 ```
 
 1. **Continuous Integration (`ci.yaml`)**:
-   - Python code quality checks with `black`, `flake8`, and `isort`.
+   - Python code quality checks with `black` and `flake8`.
    - Unit and integration tests with `pytest` using mocked vLLM backend fixtures.
    - Container linting with `hadolint`.
 2. **Continuous Delivery (`cd.yaml`)**:
-   - Authenticates to GCP using Workload Identity Federation (no long-lived service account keys stored in GitHub Secrets).
-   - Builds optimized, multi-stage production Docker image (`Dockerfile`).
+   - Authenticates to GCP using Workload Identity Federation (no long lived service account keys stored in GitHub Secrets).
+   - Builds optimized, multi stage production Docker image (`Dockerfile`).
    - Pushes images tagged with commit SHA and `latest` to Google Artifact Registry.
    - Deploys updated manifests to GKE with rollout status checks and automatic rollback on failure.
 
@@ -298,51 +298,51 @@ python chat.py --base-url https://<YOUR_INGRESS_IP_OR_DOMAIN>
 .
 ├── .github/
 │   └── workflows/
-│       ├── ci.yaml                      # Code quality, linting & unit test pipeline
-│       └── cd.yaml                      # WIF auth, Docker build, Artifact Registry & GKE deploy
-├── Images/                              # Architecture diagrams & dashboard screenshots
+│       ├── ci.yaml                      
+│       └── cd.yaml                     
+├── Images/                             
 │   ├── Deployment-Architecture-Diagram.png
 │   ├── Mistral-Chatbot-Inference-Demo.png
 │   ├── Grafana-K8s-pod-Node-Metrics.png
 │   ├── Grafana-NVIDIA-VRAM-Metrics.png
 │   └── Grafana-vLLM-Inference-Token-Metrics.png
-├── app/                                 # FastAPI API Gateway application
-│   ├── core/                           # Error handlers, lifecycle events, custom exceptions
-│   ├── middleware/                     # Request ID tracking, logging & Prometheus metrics
-│   ├── routers/                        # API route handlers (/health, /ready, /v1/chat/completions)
-│   ├── schemas/                        # Pydantic v2 schemas for OpenAI-compatible contracts
-│   ├── config.py                       # Environment configuration via pydantic-settings
-│   ├── logging_config.py               # Structured JSON logger
-│   └── main.py                         # Application entrypoint and middleware assembly
-├── k8s/                                 # Production Kubernetes manifests
-│   ├── fastapi/                        # Namespace, Deployment, Service, ConfigMap, Secrets, PDB
-│   ├── vllm/                           # vLLM GPU Deployment, Service, PDB
-│   ├── model-provisioning/             # GCS FUSE CSI driver configs & HF sync Job
-│   ├── networking/                     # Cloud Armor, ManagedCertificate, BackendConfig, Ingress
-│   └── monitoring/                     # DCGM Exporter, PrometheusRules, Grafana Dashboards
-├── terraform/                           # Infrastructure as Code (GCP & GKE)
-│   ├── artifact_registry.tf            # Google Artifact Registry repository
-│   ├── gcs.tf                          # Model storage bucket with lifecycle rules
-│   ├── gke.tf                          # Private GKE cluster & core node pool
-│   ├── node_pool_gpu.tf                # Dedicated NVIDIA L4 / A100 GPU node pool
-│   ├── networking.tf                   # VPC, Subnets, Cloud NAT, Cloud Router
-│   ├── iam.tf                          # IAM service accounts and least-privilege roles
-│   ├── workload_identity.tf            # Workload Identity Federation bindings
-│   ├── variables.tf                    # Input variable definitions
-│   ├── outputs.tf                      # Output connection strings and endpoints
-│   └── terraform.tfvars.example        # Sample environment values
-├── Dockerfile                           # Optimized multi-stage build for FastAPI Gateway
-├── docker-compose.yml                   # Local development container orchestration
-├── chat.py                              # Interactive CLI test client for Mistral completions
-├── requirements.txt                     # Pinned Python production dependencies
-└── README.md                            # Complete system documentation
+├── app/                                 
+│   ├── core/                           
+│   ├── middleware/                     
+│   ├── routers/                        
+│   ├── schemas/                       
+│   ├── config.py                       
+│   ├── logging_config.py              
+│   └── main.py                         
+├── k8s/                                 
+│   ├── fastapi/                        
+│   ├── vllm/                           
+│   ├── model-provisioning/             
+│   ├── networking/                     
+│   └── monitoring/                     
+├── terraform/                          
+│   ├── artifact_registry.tf            
+│   ├── gcs.tf                         
+│   ├── gke.tf                          
+│   ├── node_pool_gpu.tf                
+│   ├── networking.tf                  
+│   ├── iam.tf                          
+│   ├── workload_identity.tf            
+│   ├── variables.tf                    
+│   ├── outputs.tf                      
+│   └── terraform.tfvars.example        
+├── Dockerfile                           
+├── docker-compose.yml                   
+├── chat.py                              
+├── requirements.txt                     
+└── README.md                            
 ```
 
 ---
 
 ## 12. Key Implementation Highlights
 
-- **Decoupled Gateway / Inference Pattern**: Decoupling the API Gateway from the GPU inference backend allows CPU-intensive tasks (SSL termination, auth, payload validation, rate-limiting) to scale independently via horizontal pod autoscaling without paying for costly GPU nodes.
+- **Decoupled Gateway / Inference Pattern**: Decoupling the API Gateway from the GPU inference backend allows CPU intensive tasks (SSL termination, auth, payload validation, rate-limiting) to scale independently via horizontal pod autoscaling without paying for costly GPU nodes.
 - **Zero-Downtime GPU Rollouts**: Implemented `PodDisruptionBudget` (`maxUnavailable: 0`) and carefully tuned readiness probes on vLLM pods to prevent terminating active inference sessions during cluster upgrades.
 - **GCS FUSE CSI Performance Tuning**: Tuned kernel caching flags (`--stat-cache-ttl=24h`, `--type-cache-ttl=24h`, `--implicit-dirs=true`) to optimize weight loading speeds directly over GCS.
 - **Memory Management in vLLM**: Configured `--gpu-memory-utilization 0.90` and `--max-model-len 8192` to maximize KV-cache availability while avoiding CUDA Out-of-Memory (OOM) errors during high-concurrency bursts.
@@ -363,10 +363,7 @@ python chat.py --base-url https://<YOUR_INGRESS_IP_OR_DOMAIN>
 
 ## 14. Screenshots
 
-### Architecture & Deployment Topology
-![Deployment Architecture Diagram](./Images/Deployment-Architecture-Diagram.png)
-
----
+-
 
 ### Mistral-7B Chatbot Live Inference
 ![Mistral Inference Demo](./Images/Mistral-Chatbot-Inference-Demo.png)
@@ -390,7 +387,7 @@ python chat.py --base-url https://<YOUR_INGRESS_IP_OR_DOMAIN>
 
 ## 15. Future Improvements
 
-- [ ] **Multi-LoRA Dynamic Adapter Serving**: Implement dynamic LoRA loading in vLLM to serve domain-specific fine-tuned models from a single base instance.
+- [ ] **Multi-LoRA Dynamic Adapter Serving**: Implement dynamic LoRA loading in vLLM to serve domain specific fine tuned models from a single base instance.
 - [ ] **Scale-to-Zero with Knative / KEDA**: Integrate KEDA with Prometheus metrics (queue depth) to scale GPU node pools to zero during idle periods.
 - [ ] **Distributed Multi-GPU Tensor Parallelism**: Expand Terraform node pool configs to support multi-GPU instances (e.g. 4x A100 80GB) with Ray / vLLM tensor parallelism for larger 70B+ parameter models.
 - [ ] **Semantic Caching Layer**: Add Redis / DragonFly semantic caching in the FastAPI gateway to return cached responses for frequently requested prompts.

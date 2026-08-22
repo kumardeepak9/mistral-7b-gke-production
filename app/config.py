@@ -1,17 +1,4 @@
-# ─────────────────────────────────────────────────────────────────────────────
-# app/config.py
-#
-# WHY: Centralises ALL configuration in one typed, validated object.
-#      pydantic-settings reads from environment variables (and optionally a
-#      .env file in development).  In production (GKE), the same variables are
-#      injected via Kubernetes ConfigMaps / Secrets — no code change needed.
-#
-#      Benefits over raw os.environ:
-#        • Type coercion  — PORT="8000" becomes int automatically
-#        • Validation     — missing required vars raise a clear error at startup
-#        • Documentation  — Field(description=...) serves as inline docs
-#        • Testability    — tests can override settings without patching os.environ
-# ─────────────────────────────────────────────────────────────────────────────
+
 
 from typing import Literal
 
@@ -28,8 +15,7 @@ class Settings(BaseSettings):
     """
 
     model_config = SettingsConfigDict(
-        # Load .env file only in development; ignored when running in a container
-        # because the file is excluded by .dockerignore.
+        
         env_file=".env",
         env_file_encoding="utf-8",
         # Extra env vars that don't match a field are silently ignored
