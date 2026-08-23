@@ -363,7 +363,6 @@ python chat.py --base-url https://<YOUR_INGRESS_IP_OR_DOMAIN>
 
 ## 14. Screenshots
 
--
 
 ### Mistral-7B Chatbot Live Inference
 ![Mistral Inference Demo](./Images/Mistral-Chatbot-Inference-Demo.png)
