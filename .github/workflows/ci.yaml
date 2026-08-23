@@ -54,17 +54,21 @@ jobs:
         run: pip install ruff==0.6.9 black==24.10.0
 
       - name: Run ruff (linter)
-        
-        run: ruff check app/ --output-format=github
+        run: ruff check app/ tests/ --output-format=github
 
       - name: Run black (formatter check)
-        
-        run: black --check app/
+        run: black --check app/ tests/
 
- 
+  # ============================================================================
+  # JOB 2: Run Unit and Integration Tests with Coverage
+  # ============================================================================
+
   test:
     name: Test (pytest)
     runs-on: ubuntu-latest
+
+    env:
+      PYTHONPATH: .
 
     steps:
       - uses: actions/checkout@v4
@@ -77,7 +81,6 @@ jobs:
           cache-dependency-path: requirements.txt
 
       - name: Install dependencies
-       
         run: |
           pip install -r requirements.txt
           # Test-only dependencies
@@ -87,10 +90,9 @@ jobs:
                       pytest-cov==6.0.0
 
       - name: Run tests with coverage
-       
         run: |
           if [ -d "tests" ]; then
-            pytest tests/ \
+            python -m pytest tests/ \
               --cov=app \
               --cov-report=xml \
               --cov-report=term-missing \
