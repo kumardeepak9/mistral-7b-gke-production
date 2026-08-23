@@ -57,6 +57,7 @@ jobs:
       image: ${{ steps.tag.outputs.image }}
       image-repository: ${{ steps.tag.outputs.image_repository }}
       image-digest: ${{ steps.push.outputs.digest }}
+      image-tag: ${{ steps.tag.outputs.short_sha }}
 
     steps:
       - name: Checkout source code
@@ -133,6 +134,7 @@ jobs:
           echo "image=${IMAGE}" >> $GITHUB_OUTPUT
           echo "image_repository=${IMAGE_REPOSITORY}" >> $GITHUB_OUTPUT
           echo "short-sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
 
           echo "Image tag: ${IMAGE}"
 
@@ -194,20 +196,17 @@ jobs:
           password: ${{ steps.auth.outputs.access_token }}
 
       - name: Scan image for CVEs
-      
         uses: aquasecurity/trivy-action@master
         with:
-         
-          image-ref: ${{ needs.build-and-push.outputs.image-repository }}@${{ needs.build-and-push.outputs.image-digest }}
+          image-ref: ${{ needs.build-and-push.outputs.image }}
           format: sarif
           output: trivy-image-results.sarif
           severity: HIGH,CRITICAL
           exit-code: "1"
-          
           ignore-unfixed: true
 
       - name: Upload image scan results to Security tab
-        if: always()
+        if: success()
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-image-results.sarif
@@ -276,7 +275,7 @@ jobs:
       - name: Rolling update — set new image
         id: rolling-update
         run: |
-          IMAGE="${{ needs.build-and-push.outputs.image-repository }}@${{ needs.build-and-push.outputs.image-digest }}"
+          IMAGE="${{ needs.build-and-push.outputs.image }}"
           SHORT_SHA="${GITHUB_SHA::12}"
 
           echo "Deploying image: ${IMAGE}"
@@ -386,7 +385,7 @@ jobs:
       # ── Step 7: Post-deployment verification ──────────────────────────────────
       - name: Verify deployment health
         run: |
-          IMAGE="${{ needs.build-and-push.outputs.image-repository }}@${{ needs.build-and-push.outputs.image-digest }}"
+          IMAGE="${{ needs.build-and-push.outputs.image }}"
 
           echo "=== Final Pod state ==="
           kubectl get pods \
@@ -429,8 +428,6 @@ jobs:
           echo "║          ✅  DEPLOYMENT SUCCESSFUL                       ║"
           echo "╠══════════════════════════════════════════════════════════╣"
           echo "║  Image:     ${{ needs.build-and-push.outputs.image }}"
-          echo "║  Immutable: ${{ needs.build-and-push.outputs.image-repository }}@${{ needs.build-and-push.outputs.image-digest }}"
-          echo "║  Digest:    ${{ needs.build-and-push.outputs.image-digest }}"
           echo "║  Commit:    ${{ github.sha }}"
           echo "║  Actor:     ${{ github.actor }}"
           echo "║  Run:       ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
