@@ -244,12 +244,11 @@ jobs:
 
       # ── Step 2: Get GKE credentials ───────────────────────────────────────────
       - name: Get GKE cluster credentials
-      
         uses: google-github-actions/get-gke-credentials@v2
         with:
-          cluster_name: ${{ env.GKE_CLUSTER_NAME }}
-          location: ${{ env.GKE_CLUSTER_REGION }}
-          project_id: ${{ env.GCP_PROJECT_ID }}
+          cluster_name: ${{ secrets.GKE_CLUSTER_NAME }}
+          location: ${{ secrets.GKE_CLUSTER_REGION }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
 
       # ── Step 3: Pre-deployment verification ──────────────────────────────────
       - name: Verify cluster connection and current state
