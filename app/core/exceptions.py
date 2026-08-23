@@ -24,9 +24,15 @@ def add_exception_handlers(app: FastAPI) -> None:
         request_id = _request_id(request)
         logger.warning(
             "Request validation failed",
-            extra={"request_id": request_id, "path": request.url.path, "errors": exc.errors()},
+            extra={
+                "request_id": request_id,
+                "path": request.url.path,
+                "errors": exc.errors(),
+            },
         )
-        payload = ErrorResponse(detail="Request validation failed", request_id=request_id)
+        payload = ErrorResponse(
+            detail="Request validation failed", request_id=request_id
+        )
         return JSONResponse(status_code=422, content=payload.model_dump())
 
     @app.exception_handler(StarletteHTTPException)
@@ -58,4 +64,6 @@ def add_exception_handlers(app: FastAPI) -> None:
             extra={"request_id": request_id, "path": request.url.path},
         )
         payload = ErrorResponse(detail="Internal server error", request_id=request_id)
-        return JSONResponse(status_code=HTTP_500_INTERNAL_SERVER_ERROR, content=payload.model_dump())
+        return JSONResponse(
+            status_code=HTTP_500_INTERNAL_SERVER_ERROR, content=payload.model_dump()
+        )

@@ -19,14 +19,13 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 import logging
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
 
 import httpx
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
 from prometheus_fastapi_instrumentator import Instrumentator
 
 from app.config import settings
@@ -88,7 +87,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Store on app.state so routers can access it via request.app.state.http_client
     app.state.http_client = http_client
 
-    logger.info("HTTP client pool initialised", extra={"vllm_base_url": str(settings.vllm_base_url)})
+    logger.info(
+        "HTTP client pool initialised",
+        extra={"vllm_base_url": str(settings.vllm_base_url)},
+    )
 
     yield  # ← application runs here
 
@@ -115,8 +117,8 @@ def create_application() -> FastAPI:
             "Proxies OpenAI-compatible requests to the vLLM backend running on GPU nodes."
         ),
         version=settings.app_version,
-        docs_url="/docs",        # Swagger UI
-        redoc_url="/redoc",      # ReDoc UI
+        docs_url="/docs",  # Swagger UI
+        redoc_url="/redoc",  # ReDoc UI
         openapi_url="/openapi.json",
         lifespan=lifespan,
     )
@@ -204,6 +206,6 @@ if __name__ == "__main__":
         port=settings.port,
         workers=settings.workers,
         reload=not settings.is_production,  # Hot-reload in dev only
-        log_config=None,   # Disable Uvicorn's default logging — ours handles it
+        log_config=None,  # Disable Uvicorn's default logging — ours handles it
         access_log=False,  # Access logging is handled by RequestLoggingMiddleware
     )

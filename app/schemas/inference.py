@@ -27,7 +27,9 @@ class ChatCompletionRequest(BaseModel):
         ge=1,
         description="Maximum tokens to generate",
     )
-    temperature: float = Field(default=0.7, ge=0.0, le=2.0, description="Sampling temperature")
+    temperature: float = Field(
+        default=0.7, ge=0.0, le=2.0, description="Sampling temperature"
+    )
     stream: bool = Field(default=False, description="Streaming mode flag")
 
 

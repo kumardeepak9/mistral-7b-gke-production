@@ -99,7 +99,10 @@ async def chat_completions(
             detail="vLLM upstream request timed out",
         ) from exc
     except httpx.RequestError as exc:
-        logger.error("vLLM upstream request error", extra={"request_id": request_id, "error": str(exc)})
+        logger.error(
+            "vLLM upstream request error",
+            extra={"request_id": request_id, "error": str(exc)},
+        )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Unable to reach vLLM upstream",
@@ -108,7 +111,10 @@ async def chat_completions(
     if upstream_response.status_code >= 400:
         logger.warning(
             "vLLM upstream returned error response",
-            extra={"request_id": request_id, "status_code": upstream_response.status_code},
+            extra={
+                "request_id": request_id,
+                "status_code": upstream_response.status_code,
+            },
         )
         raise HTTPException(
             status_code=upstream_response.status_code,
@@ -118,7 +124,9 @@ async def chat_completions(
     try:
         response_payload = upstream_response.json()
     except ValueError as exc:
-        logger.error("vLLM upstream returned non-JSON payload", extra={"request_id": request_id})
+        logger.error(
+            "vLLM upstream returned non-JSON payload", extra={"request_id": request_id}
+        )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="vLLM upstream returned an invalid response payload",
@@ -158,7 +166,8 @@ async def _stream_chat_completions(
         await upstream_stream.__aexit__(None, None, None)
         raise HTTPException(
             status_code=upstream_response.status_code,
-            detail=error_body.decode("utf-8", errors="replace") or "vLLM upstream stream failed",
+            detail=error_body.decode("utf-8", errors="replace")
+            or "vLLM upstream stream failed",
         )
 
     async def iterator() -> AsyncIterator[bytes]:

@@ -1,5 +1,3 @@
-
-
 from typing import Literal
 
 from pydantic import AnyHttpUrl, Field, field_validator, model_validator
@@ -15,7 +13,6 @@ class Settings(BaseSettings):
     """
 
     model_config = SettingsConfigDict(
-        
         env_file=".env",
         env_file_encoding="utf-8",
         # Extra env vars that don't match a field are silently ignored

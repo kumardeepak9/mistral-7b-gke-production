@@ -1,5 +1,5 @@
-from fastapi.testclient import TestClient
 import httpx
+from fastapi.testclient import TestClient
 
 from app.config import settings
 
@@ -66,7 +66,11 @@ def test_chat_completions_proxies_non_stream_response(
                         "finish_reason": "stop",
                     }
                 ],
-                "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 2,
+                    "total_tokens": 7,
+                },
             },
         )
 

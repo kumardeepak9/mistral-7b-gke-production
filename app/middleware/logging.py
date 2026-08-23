@@ -57,8 +57,10 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         # Resolve client IP — behind GCP Load Balancer / Cloud Armor the real
         # IP is in X-Forwarded-For, not request.client.host
         forwarded_for = request.headers.get("X-Forwarded-For")
-        client_ip = forwarded_for.split(",")[0].strip() if forwarded_for else (
-            request.client.host if request.client else "unknown"
+        client_ip = (
+            forwarded_for.split(",")[0].strip()
+            if forwarded_for
+            else (request.client.host if request.client else "unknown")
         )
 
         # ── Skip health probes ────────────────────────────────────────────────
