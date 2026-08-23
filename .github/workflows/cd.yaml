@@ -29,6 +29,7 @@ env:
   REGION: ${{ secrets.GKE_CLUSTER_REGION }}
   ARTIFACT_REGISTRY_HOST: ${{ secrets.GKE_CLUSTER_REGION }}-docker.pkg.dev
   REPOSITORY: mistral-registry
+  ARTIFACT_REGISTRY_REPO: mistral-registry
   IMAGE_NAME: mistral-inference-gateway
   NAMESPACE: mistral-gateway
   DEPLOYMENT_NAME: fastapi
@@ -54,7 +55,7 @@ jobs:
 
 
     outputs:
-      image: ${{ steps.tag.outputs.image }}
+      image: ${{ steps.tag.outputs.image || format('{0}/{1}/{2}/{3}:{4}', env.ARTIFACT_REGISTRY_HOST, secrets.GCP_PROJECT_ID, env.ARTIFACT_REGISTRY_REPO, env.IMAGE_NAME, github.sha) }}
       image-repository: ${{ steps.tag.outputs.image_repository }}
       image-digest: ${{ steps.push.outputs.digest }}
       image-tag: ${{ steps.tag.outputs.short_sha }}
@@ -198,7 +199,8 @@ jobs:
       - name: Scan image for CVEs
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ needs.build-and-push.outputs.image }}
+          scan-type: 'image'
+          image-ref: '${{ needs.build-and-push.outputs.image }}'
           format: sarif
           output: trivy-image-results.sarif
           severity: HIGH,CRITICAL
