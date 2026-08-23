@@ -133,6 +133,19 @@ output "workload_identity_pool" {
   value       = local.workload_identity_pool
 }
 
+# ── GitHub Actions Workload Identity Federation ─────────────────────────────
+
+output "github_actions_workload_identity_provider" {
+  description = "Workload Identity Provider resource name for GitHub Actions (use as GCP_WORKLOAD_IDENTITY_PROVIDER secret)."
+  value       = google_iam_workload_identity_pool_provider.github_actions.name
+}
+
+output "github_actions_service_account" {
+  description = "GCP Service Account email for GitHub Actions CI/CD (use as GCP_SERVICE_ACCOUNT secret)."
+  value       = google_service_account.github_actions_sa.email
+}
+
+
 # ── Post-Apply Instructions ────────────────────────────────────────────────────
 
 output "next_steps" {

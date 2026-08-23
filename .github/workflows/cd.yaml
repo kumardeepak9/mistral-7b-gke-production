@@ -195,7 +195,7 @@ jobs:
 
       - name: Scan image for CVEs
       
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@master
         with:
          
           image-ref: ${{ needs.build-and-push.outputs.image-repository }}@${{ needs.build-and-push.outputs.image-digest }}
